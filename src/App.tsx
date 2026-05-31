@@ -138,6 +138,8 @@ interface SurfacePickMetadata {
   uvCalibrationScaleU?: number
   uvCalibrationScaleV?: number
   uvCalibrationTargetSource?: string
+  /** HPNT (hardpoint) anchors discovered along the resolved appearance chain. */
+  hardpoints?: { name: string; matrix: number[]; sourcePath?: string }[]
 }
 
 function buildPartTextureKey(templatePath: string, partIndex: number): string {
@@ -642,6 +644,23 @@ const PreviewCanvas = memo(function PreviewCanvas({
           '',
         ]
       })()),
+      ...((meta.hardpoints && meta.hardpoints.length > 0)
+        ? [
+            `--- Hardpoints (${meta.hardpoints.length}) ---`,
+            ...meta.hardpoints.map((hp) => {
+              const m = hp.matrix
+              const tx = m[3].toFixed(3)
+              const ty = m[7].toFixed(3)
+              const tz = m[11].toFixed(3)
+              const r0 = `${m[0].toFixed(3)},${m[1].toFixed(3)},${m[2].toFixed(3)}`
+              const r1 = `${m[4].toFixed(3)},${m[5].toFixed(3)},${m[6].toFixed(3)}`
+              const r2 = `${m[8].toFixed(3)},${m[9].toFixed(3)},${m[10].toFixed(3)}`
+              const src = hp.sourcePath ? ` @ ${hp.sourcePath}` : ''
+              return `  ${hp.name}: t=(${tx}, ${ty}, ${tz}) R=[${r0} | ${r1} | ${r2}]${src}`
+            }),
+            '',
+          ]
+        : []),
       `nearOverlapHitCount: ${overlapHits.length}`,
       ...overlapLines,
       '',
@@ -1815,6 +1834,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
               uvCalibrationScaleU: 1,
               uvCalibrationScaleV: 1,
               uvCalibrationTargetSource: 'deterministic',
+              hardpoints: rootVisual.hardpoints,
             } satisfies SurfacePickMetadata,
           }
           partMesh.renderOrder = partDomain === 'interior' ? 0 : 1
@@ -1929,6 +1949,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
             detailAddressU: resolved.meshPartSecondaryTextureAddressU?.[0],
             detailAddressV: resolved.meshPartSecondaryTextureAddressV?.[0],
             chunkTrace: resolved.meshPartChunkTrace?.[0],
+            hardpoints: resolved.hardpoints,
           } satisfies SurfacePickMetadata,
         }
 

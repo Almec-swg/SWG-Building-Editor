@@ -58,6 +58,8 @@ export interface ResolvedTemplateVisual {
   meshPartShaderPaths?: (string | undefined)[]
   meshPartEffectPaths?: (string | undefined)[]
   meshPartDomains?: ('exterior' | 'interior')[]
+  /** Hardpoints (HPNT chunks) discovered along the appearance / cell / CMP chain. */
+  hardpoints?: MeshHardpoint[]
   effectPath?: string
   effectOptionCodes?: string[]
   vertexProgramPaths?: string[]
@@ -65,6 +67,20 @@ export interface ResolvedTemplateVisual {
   shaderStageTexturePaths?: string[]
   shaderStageNormalTexturePaths?: string[]
   status: 'mesh' | 'appearance-only' | 'object-only' | 'missing'
+}
+
+/**
+ * A SWG HPNT chunk: a named anchor on a mesh/appearance used by the engine to
+ * attach child objects (door handles, signage, weapons on racks, etc.) or to
+ * mark positions of interest (door portals, FX origins). The matrix is a
+ * mesh-local affine transform laid out as three rows of (Rx, Ry, Rz, Tx).
+ */
+export interface MeshHardpoint {
+  name: string
+  /** 12 floats, row-major 3x4: [R0xyz, T0, R1xyz, T1, R2xyz, T2]. */
+  matrix: number[]
+  /** IFF file the hardpoint was discovered in (MSH/CMP/POB/etc.). */
+  sourcePath?: string
 }
 
 export type RepositoryLookup = (path: string) => Promise<RepositorySourceFile | null>
@@ -3875,6 +3891,46 @@ function extractPobCellAppearanceRefs(
   return entries
 }
 
+/**
+ * Extracts all HPNT (hardpoint) chunks from an IFF buffer (MSH/CMP/POB/etc.).
+ * Each HPNT chunk's data layout is:
+ *   float32[12] matrix     — 3x4 affine, row-major rotation+translation
+ *   char[]      name       — null-terminated ASCII
+ * Engine source uses little-endian floats; we fall back to big-endian if the
+ * LE decode fails plausibility (some converters round-trip swapped).
+ */
+function extractHardpointsFromBuffer(buffer: ArrayBuffer, sourcePath?: string): MeshHardpoint[] {
+  const bytes = new Uint8Array(buffer)
+  const root = parseBigEndianChunks(bytes)
+  if (!root) return []
+
+  const out: MeshHardpoint[] = []
+  const stack: BinaryChunk[] = [root]
+  while (stack.length > 0) {
+    const node = stack.pop()
+    if (!node) continue
+    for (const child of node.children) stack.push(child)
+    if (node.tag !== 'HPNT' || node.type) continue
+    const size = node.dataEnd - node.dataStart
+    if (size < 49) continue // 12 floats + at least null terminator
+
+    const payload = bytes.subarray(node.dataStart, node.dataEnd)
+    let matrix = readAffineMatrix(payload, 0, true)
+    if (!isReasonableAffineMatrix(matrix)) {
+      const be = readAffineMatrix(payload, 0, false)
+      if (isReasonableAffineMatrix(be)) matrix = be
+    }
+    if (!isReasonableAffineMatrix(matrix)) continue
+
+    const nameRead = readInlineStringWithEncoding(payload, 48, 'cstr')
+    const name = nameRead.value.trim()
+    if (!name) continue
+
+    out.push({ name, matrix: matrix as number[], sourcePath })
+  }
+  return out
+}
+
 function extractDtlLastChildRef(buffer: ArrayBuffer, basePath: string): string | null {
   const bytes = new Uint8Array(buffer)
   const root = parseBigEndianChunks(bytes)
@@ -5440,6 +5496,52 @@ export async function resolveTemplateVisual(
   meshCandidates = Array.from(new Set(meshCandidates))
   const effectiveExteriorCandidatesUnordered = meshCandidates
 
+  // ---------------- Hardpoint aggregation ----------------
+  // Collect HPNT chunks along the entire appearance chain (top appearance buffer,
+  // each POB cell's appearance, each declared CMP/MSH/LOD in the candidate set).
+  // Dedupe by name + translation so we don't list mirror buffers twice.
+  const collectedHardpoints: MeshHardpoint[] = []
+  {
+    const seenHpKeys = new Set<string>()
+    const addHardpoints = (list: MeshHardpoint[]) => {
+      for (const hp of list) {
+        const t = hp.matrix
+        const key = `${hp.name}|${t[3].toFixed(3)},${t[7].toFixed(3)},${t[11].toFixed(3)}`
+        if (seenHpKeys.has(key)) continue
+        seenHpKeys.add(key)
+        collectedHardpoints.push(hp)
+      }
+    }
+    addHardpoints(extractHardpointsFromBuffer(appearanceBuffer, appearancePath))
+
+    const scanPaths = new Set<string>()
+    for (const entry of pobCellEntries) scanPaths.add(entry.ref)
+    for (const candidate of meshCandidates) {
+      const e = ext(candidate)
+      if (e === '.msh' || e === '.lod' || e === '.cmp' || e === '.pob' || e === '.apt') {
+        scanPaths.add(candidate)
+      }
+    }
+    scanPaths.delete(appearancePath)
+
+    // Cap scans to avoid runaway lookups on pathological assets.
+    let scanned = 0
+    const MAX_HP_SCANS = 256
+    for (const p of scanPaths) {
+      if (scanned >= MAX_HP_SCANS) break
+      scanned += 1
+      try {
+        const src = await lookup(p)
+        if (!src) continue
+        const buf = await src.file.arrayBuffer()
+        addHardpoints(extractHardpointsFromBuffer(buf, p))
+      } catch {
+        // Best-effort: a single broken buffer should not block resolution.
+      }
+    }
+  }
+  // -------------------------------------------------------
+
   const extPriority = (value: string): number => {
     const valueExt = ext(value)
     if (valueExt === '.msh') return 0
@@ -5698,6 +5800,7 @@ export async function resolveTemplateVisual(
         meshPath: appearancePath,
         sourceLabel: appearanceSource.sourceLabel,
         mesh: pobMeshFallback,
+        hardpoints: collectedHardpoints.length ? collectedHardpoints : undefined,
         status: 'mesh',
       }
     }
@@ -5725,6 +5828,7 @@ export async function resolveTemplateVisual(
       shaderStageTexturePaths,
       shaderStageNormalTexturePaths,
       sourceLabel: appearanceSource.sourceLabel,
+      hardpoints: collectedHardpoints.length ? collectedHardpoints : undefined,
       status: 'appearance-only',
     }
   }
@@ -6133,6 +6237,7 @@ export async function resolveTemplateVisual(
     meshPartChunkTrace: renderMeshPartChunkTrace.length
       ? renderMeshPartChunkTrace
       : undefined,
+    hardpoints: collectedHardpoints.length ? collectedHardpoints : undefined,
     status: finalMesh ? 'mesh' : 'appearance-only',
   }
 }
