@@ -9,6 +9,8 @@ export interface PreviewMeshData {
   uvSets?: number[][] // All declared UV sets by index (0..N-1)
   /** True when the vertex format declares a UV channel; false when confirmed absent; undefined when unknown. */
   hasUvChannel?: boolean
+  /** Debug-only: human-readable summary of how the MSH decoder interpreted this part's vertex stream. */
+  decodeDebug?: string
 }
 
 export interface RepositorySourceFile {
@@ -41,6 +43,8 @@ export interface ResolvedTemplateVisual {
   meshPartNormalTextureAddressU?: (TextureAddressMode | undefined)[]
   meshPartNormalTextureAddressV?: (TextureAddressMode | undefined)[]
   meshPartPrimaryUvSetIndices?: number[]
+  meshPartPrimaryScaleU?: (number | undefined)[]
+  meshPartPrimaryScaleV?: (number | undefined)[]
   meshPartTextureAddressU?: (TextureAddressMode | undefined)[]
   meshPartTextureAddressV?: (TextureAddressMode | undefined)[]
   meshPartTextureMipmapFilter?: (TextureFilterMode | undefined)[]
@@ -52,6 +56,7 @@ export interface ResolvedTemplateVisual {
   meshPartSecondaryTextureAddressV?: (TextureAddressMode | undefined)[]
   meshPartChunkTrace?: (string | undefined)[]
   meshPartShaderPaths?: (string | undefined)[]
+  meshPartEffectPaths?: (string | undefined)[]
   meshPartDomains?: ('exterior' | 'interior')[]
   effectPath?: string
   effectOptionCodes?: string[]
@@ -79,6 +84,8 @@ type ShaderResolutionResult = {
   textureMipmapFilter?: TextureFilterMode
   textureMinificationFilter?: TextureFilterMode
   textureMagnificationFilter?: TextureFilterMode
+  primaryScaleU?: number
+  primaryScaleV?: number
   normalTexturePath?: string
   normalTextureSourceLabel?: string
   normalTextureAddressU?: TextureAddressMode
@@ -88,6 +95,8 @@ type ShaderResolutionResult = {
   secondaryUvSetIndex: number
   secondaryTextureAddressU?: TextureAddressMode
   secondaryTextureAddressV?: TextureAddressMode
+  secondaryScaleU?: number
+  secondaryScaleV?: number
 } | null
 
 const shaderTextureResolutionCache = new Map<string, Promise<ShaderResolutionResult>>()
@@ -110,6 +119,12 @@ const shaderStageRefsCache = new Map<string, {
   secondaryAddressV?: TextureAddressMode
   normalAddressU?: TextureAddressMode
   normalAddressV?: TextureAddressMode
+  alphaTest: boolean
+  alphaReference: number
+  transparent: boolean
+  alphaBlend: boolean
+  effectTags: string[]
+  shaderDebugChunks?: string[]
 }>()
 const effectRecipeCache = new Map<string, {
   optionCodes: string[]
@@ -117,6 +132,7 @@ const effectRecipeCache = new Map<string, {
   pixelPrograms: string[]
 }>()
 const effectDeclaredTextureRefsCache = new Map<string, Array<{ path: string; slot: ShaderTextureSlot; order: number }>>()
+const effectDebugChunksCache = new Map<string, string[]>()
 const resolvedRefCandidatesCache = new Map<string, string[]>()
 
 export function clearPreviewResolverCaches(): void {
@@ -124,7 +140,76 @@ export function clearPreviewResolverCaches(): void {
   shaderStageRefsCache.clear()
   effectRecipeCache.clear()
   effectDeclaredTextureRefsCache.clear()
+  effectDebugChunksCache.clear()
   resolvedRefCandidatesCache.clear()
+}
+
+export function getShaderDebugChunks(shaderPath: string): string[] | undefined {
+  const normalized = normalizeSwgPath(shaderPath)
+  const cached = shaderStageRefsCache.get(normalized)
+  return cached?.shaderDebugChunks
+}
+
+export function getEffectDebugChunks(effectPath: string): string[] | undefined {
+  const normalized = normalizeSwgPath(effectPath)
+  return effectDebugChunksCache.get(normalized)
+}
+
+function captureEffectDebugChunks(effectBuffer: ArrayBuffer, effectPath: string): string[] {
+  const normalized = normalizeSwgPath(effectPath)
+  const cached = effectDebugChunksCache.get(normalized)
+  if (cached) return cached
+  const bytes = new Uint8Array(effectBuffer)
+  const root = parseBigEndianChunks(bytes)
+  const out: string[] = []
+  if (!root) {
+    effectDebugChunksCache.set(normalized, out)
+    return out
+  }
+  const walk = (node: BinaryChunk, depth = 0) => {
+    const indent = '  '.repeat(depth)
+    if (node.type) {
+      out.push(`${indent}${node.tag}:${node.type}`)
+    } else {
+      const dataSize = node.dataEnd - node.dataStart
+      const maxBytesToShow = 4096
+      if (dataSize > 0 && dataSize <= maxBytesToShow) {
+        const hex: string[] = []
+        const ascii: string[] = []
+        for (let i = node.dataStart; i < node.dataEnd; i++) {
+          const b = bytes[i]
+          hex.push(b.toString(16).padStart(2, '0'))
+          ascii.push(b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.')
+        }
+        out.push(`${indent}${node.tag} (${dataSize}B) [${hex.join(' ')}] "${ascii.join('')}"`)
+      } else {
+        out.push(`${indent}${node.tag} (${dataSize} bytes - truncated)`)
+      }
+    }
+    for (const child of node.children) walk(child, depth + 1)
+  }
+  walk(root)
+  effectDebugChunksCache.set(normalized, out)
+  return out
+}
+
+export function getShaderRenderProps(shaderPath: string): {
+  alphaTest: boolean
+  alphaReference: number
+  transparent: boolean
+  alphaBlend: boolean
+  effectTags: string[]
+} | undefined {
+  const normalized = normalizeSwgPath(shaderPath)
+  const cached = shaderStageRefsCache.get(normalized)
+  if (!cached) return undefined
+  return {
+    alphaTest: cached.alphaTest,
+    alphaReference: cached.alphaReference,
+    transparent: cached.transparent,
+    alphaBlend: cached.alphaBlend,
+    effectTags: [...cached.effectTags],
+  }
 }
 
 const refRegex = /[a-z0-9_./\\-]+\.(?:iff|pob|apt|lod|msh|cmp|flr|sat|sht|eft|vsh|psh|dds|tga)/gi
@@ -175,6 +260,8 @@ function extensionDirectories(fileExt: string): string[] {
 
 function resolveRefCandidates(basePath: string, ref: string): string[] {
   const clean = normalizeSwgPath(ref)
+  // SWG uses exact paths as they appear in the data files.
+  // If the reference contains a directory separator, use it exactly.
   if (clean.includes('/')) return [clean]
 
   const results: string[] = []
@@ -186,14 +273,18 @@ function resolveRefCandidates(basePath: string, ref: string): string[] {
     results.push(normalized)
   }
 
+  // Priority 1: Relative to the referencing file's directory (same directory as shader/mesh)
   const dir = dirname(normalizeSwgPath(basePath))
   if (dir) push(`${dir}/${clean}`)
-  push(clean)
 
+  // Priority 2: Standard extension-specific directories (texture/, appearance/texture/, etc.)
   const fileExt = ext(clean)
   for (const root of extensionDirectories(fileExt)) {
     push(`${root}/${clean}`)
   }
+
+  // Priority 3: Root level (least preferred - avoid ambiguity)
+  push(clean)
 
   return results
 }
@@ -789,28 +880,63 @@ function extractUvsFromFvfFlags(
   vertexFlags: number,
   uvSetIndex = 0,
 ): number[] | undefined {
-  // Strict parity mode: reject FVF decodes unless the implied stride matches
-  // the observed vertex stride exactly. This prevents malformed INFO flags from
-  // pulling UVs from the wrong offsets.
+  // FVF parity:
+  //  - For uvSetIndex 0 we accept any bytesPerVertex >= expectedStride. Extra
+  //    bytes commonly carry tangent + handedness (trailing) for normal-mapped
+  //    meshes, or D3DCOLOR diffuse/specular (between normal and UV) for some
+  //    interior meshes. We try the canonical offset first and, if the values
+  //    look like sentinels (non-finite or magnitudes far outside any plausible
+  //    UV range), we walk forward in 4-byte steps until we find a stream that
+  //    passes a sanity check. This rescues palace-exterior (UV at the
+  //    canonical offset with trailing tangent) and palace-interior (UV after
+  //    a 4-byte color field).
+  //  - For uvSetIndex >= 1 we still require exact parity, because guessing a
+  //    secondary UV offset is fragile and almost always wrong when the stride
+  //    does not match the declared texCount.
   const texCount = (vertexFlags & 0x0f00) >>> 8
   if (texCount === 0 || uvSetIndex >= texCount) return undefined
   const baseUvOffset = uvOffsetFromFvfFlags(vertexFlags, bytesPerVertex)
   const expectedStride = baseUvOffset + texCount * 8
-  if (expectedStride !== bytesPerVertex) return undefined
+  if (uvSetIndex === 0) {
+    if (bytesPerVertex < expectedStride) return undefined
+  } else {
+    if (expectedStride !== bytesPerVertex) return undefined
+  }
 
-  const uvOffset = baseUvOffset + uvSetIndex * 8
-  if (uvOffset + 8 > bytesPerVertex) return undefined
+  const canonicalOffset = baseUvOffset + uvSetIndex * 8
+  if (canonicalOffset + 8 > bytesPerVertex) return undefined
 
   const view = new DataView(dataPayload.buffer, dataPayload.byteOffset, dataPayload.byteLength)
-  const out: number[] = []
-  for (let i = 0; i < numVertices; i++) {
-    const base = i * bytesPerVertex + uvOffset
-    if (base + 8 > dataPayload.length) break
-    const u = view.getFloat32(base, true)
-    const v = view.getFloat32(base + 4, true)
-    out.push(Number.isFinite(u) ? u : 0, Number.isFinite(v) ? v : 0)
+
+  // Sanity threshold for "looks like a UV": values must be finite and within
+  // a generous tiling envelope. Real SWG UVs occasionally tile beyond [0,1]
+  // (e.g. -6..9 on the throne mesh) but never approach 1e6 — that magnitude
+  // only appears when we land in a packed-color / NaN-sentinel field.
+  const isPlausibleUv = (u: number, v: number): boolean => {
+    if (!Number.isFinite(u) || !Number.isFinite(v)) return false
+    if (Math.abs(u) > 1_000_000 || Math.abs(v) > 1_000_000) return false
+    return true
   }
-  return out.length >= numVertices * 2 ? out : undefined
+
+  // For set 0 we may need to shift forward past padding/color fields. For
+  // higher sets we keep the canonical offset only.
+  const maxShift = uvSetIndex === 0 ? bytesPerVertex - (canonicalOffset + 8) : 0
+  for (let shift = 0; shift <= maxShift; shift += 4) {
+    const uvOffset = canonicalOffset + shift
+    if (uvOffset + 8 > bytesPerVertex) break
+    const out: number[] = []
+    let allPlausible = true
+    for (let i = 0; i < numVertices; i++) {
+      const base = i * bytesPerVertex + uvOffset
+      if (base + 8 > dataPayload.length) { allPlausible = false; break }
+      const u = view.getFloat32(base, true)
+      const v = view.getFloat32(base + 4, true)
+      if (!isPlausibleUv(u, v)) { allPlausible = false; break }
+      out.push(u, v)
+    }
+    if (allPlausible && out.length >= numVertices * 2) return out
+  }
+  return undefined
 }
 
 function scoreUvCandidate(uvs: number[] | undefined, numVertices: number): number {
@@ -988,21 +1114,71 @@ function decodeStructuredMeshFromScope(bytes: Uint8Array, scope: BinaryChunk): P
   if (fallback.length < 3) return null
 
   const meshNormals = normals.length === vertexCount * 3 ? normals : undefined
+  const allUvSets = fvfTexCount !== undefined && fvfTexCount > 0
+    ? Array.from({ length: fvfTexCount }, (_, uvSetIndex) =>
+        extractUvsFromFvfFlags(dataPayload, vertexCount, bytesPerVertex, vertexFlags, uvSetIndex),
+      ).filter((set): set is number[] => Boolean(set && set.length >= vertexCount * 2))
+    : []
+
+  // Build a decode-debug summary so the surface picker can show what the MSH decoder actually saw.
+  const decodeDebugLines: string[] = []
+  decodeDebugLines.push(`vertexFlags=0x${vertexFlags.toString(16).padStart(8, '0')} fvfTexCount=${fvfTexCount ?? 'n/a'} bytesPerVertex=${bytesPerVertex} numVertices=${numVertices} hasNormalsInVertex=${hasNormalsInVertex} uvOffset=${uvOffsetFromFvfFlags(vertexFlags, bytesPerVertex)}`)
+  const maxBytesToDump = Math.min(dataPayload.length, bytesPerVertex * Math.min(vertexCount, 8))
+  const hexBytes: string[] = []
+  for (let i = 0; i < maxBytesToDump; i++) hexBytes.push(dataPayload[i].toString(16).padStart(2, '0'))
+  for (let v = 0; v < Math.min(vertexCount, 8); v++) {
+    const start = v * bytesPerVertex * 2
+    const end = start + bytesPerVertex * 2
+    const hex = hexBytes.slice(v * bytesPerVertex, (v + 1) * bytesPerVertex).join(' ')
+    decodeDebugLines.push(`vtxRaw[${v}] ${hex}`)
+    void start; void end
+  }
+  for (let s = 0; s < allUvSets.length; s++) {
+    const set = allUvSets[s]
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+    for (let i = 0; i + 1 < set.length; i += 2) {
+      const u = set[i], vv = set[i + 1]
+      if (u < minU) minU = u; if (u > maxU) maxU = u
+      if (vv < minV) minV = vv; if (vv > maxV) maxV = vv
+    }
+    decodeDebugLines.push(`uvSet[${s}] range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+  }
+  // Try alternate UV offsets so we can see if there's a stream that actually varies with position.
+  for (let altOffset = 12; altOffset + 8 <= bytesPerVertex; altOffset += 4) {
+    if (altOffset === uvOffsetFromFvfFlags(vertexFlags, bytesPerVertex)) continue
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+    let allFinite = true
+    for (let i = 0; i < vertexCount; i++) {
+      const base = i * bytesPerVertex + altOffset
+      if (base + 8 > dataPayload.length) { allFinite = false; break }
+      const u = dataView.getFloat32(base, true)
+      const v = dataView.getFloat32(base + 4, true)
+      if (!Number.isFinite(u) || !Number.isFinite(v) || Math.abs(u) > 1e6 || Math.abs(v) > 1e6) { allFinite = false; break }
+      if (u < minU) minU = u; if (u > maxU) maxU = u
+      if (v < minV) minV = v; if (v > maxV) maxV = v
+    }
+    if (allFinite) {
+      decodeDebugLines.push(`altOffset=${altOffset} range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+    }
+  }
+  const decodeDebug = decodeDebugLines.join('\n')
+
   const raw: PreviewMeshData = {
     positions,
     indices: fallback,
     normals: meshNormals,
     uvs,
     uvs1,
-    uvSets: fvfTexCount !== undefined && fvfTexCount > 0
-      ? Array.from({ length: fvfTexCount }, (_, uvSetIndex) =>
-          extractUvsFromFvfFlags(dataPayload, vertexCount, bytesPerVertex, vertexFlags, uvSetIndex),
-        ).filter((set): set is number[] => Boolean(set && set.length >= vertexCount * 2))
-      : [],
+    uvSets: allUvSets,
     hasUvChannel,
+    decodeDebug,
   }
   const pruned = pruneSpikyTriangles(raw)
-  return pruned && pruned.indices.length >= 3 ? pruned : raw
+  if (pruned && pruned.indices.length >= 3) {
+    pruned.decodeDebug = decodeDebug
+    return pruned
+  }
+  return raw
 }
 
 function extractStrictSpsMshMeshes(bytes: Uint8Array, root: BinaryChunk): PreviewMeshData[] {
@@ -1163,6 +1339,44 @@ function extractStructuredMshMeshes(bytes: Uint8Array, root: BinaryChunk): Previ
       uvs1,
       uvSets: uvSets.length > 0 ? uvSets : undefined,
       hasUvChannel,
+    }
+    // DEBUG: capture how the strict SPS decoder interpreted this part's vertex stream.
+    {
+      const ddLines: string[] = []
+      ddLines.push(`[strictSps] vertexFlags=0x${vertexFlags.toString(16).padStart(8, '0')} fvfTexCount=${fvfTexCount ?? 'n/a'} bytesPerVertex=${bytesPerVertex} numVertices=${numVertices} hasNormalsInVertex=${hasNormalsInVertex}`)
+      const dumpVerts = Math.min(vertexCount, 8)
+      for (let v = 0; v < dumpVerts; v++) {
+        const start = v * bytesPerVertex
+        const end = Math.min(start + bytesPerVertex, dataPayload.length)
+        const hex: string[] = []
+        for (let b = start; b < end; b++) hex.push(dataPayload[b].toString(16).padStart(2, '0'))
+        ddLines.push(`vtxRaw[${v}] ${hex.join(' ')}`)
+      }
+      for (let s = 0; s < uvSets.length; s++) {
+        const set = uvSets[s]
+        let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+        for (let i = 0; i + 1 < set.length; i += 2) {
+          const u = set[i], vv = set[i + 1]
+          if (u < minU) minU = u; if (u > maxU) maxU = u
+          if (vv < minV) minV = vv; if (vv > maxV) maxV = vv
+        }
+        ddLines.push(`uvSet[${s}] range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+      }
+      for (let altOffset = 12; altOffset + 8 <= bytesPerVertex; altOffset += 4) {
+        let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+        let ok = true
+        for (let i = 0; i < vertexCount; i++) {
+          const base2 = i * bytesPerVertex + altOffset
+          if (base2 + 8 > dataPayload.length) { ok = false; break }
+          const u = dataView.getFloat32(base2, true)
+          const v2 = dataView.getFloat32(base2 + 4, true)
+          if (!Number.isFinite(u) || !Number.isFinite(v2) || Math.abs(u) > 1e6 || Math.abs(v2) > 1e6) { ok = false; break }
+          if (u < minU) minU = u; if (u > maxU) maxU = u
+          if (v2 < minV) minV = v2; if (v2 > maxV) maxV = v2
+        }
+        if (ok) ddLines.push(`altOffset=${altOffset} range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+      }
+      raw.decodeDebug = ddLines.join('\n')
     }
     const rawScore = scoreIndexTopology(raw.positions, raw.indices)
     if (!Number.isFinite(rawScore)) continue
@@ -1690,6 +1904,7 @@ function pruneSpikyTriangles(mesh: PreviewMeshData): PreviewMeshData | null {
     uvs1: mesh.uvs1,
     uvSets: mesh.uvSets,
     hasUvChannel: mesh.hasUvChannel,
+    decodeDebug: mesh.decodeDebug,
   }
 }
 
@@ -1847,13 +2062,24 @@ async function resolveFirstExistingInOrder(
   lookup: RepositoryLookup,
 ): Promise<{ path: string; source: RepositorySourceFile } | null> {
   const seen = new Set<string>()
+  const isTexture = refs.length > 0 && (refs[0].endsWith('.dds') || refs[0].endsWith('.tga'))
+  
+  if (isTexture && refs.length > 0) {
+    console.log(`[Candidate Check] Checking ${refs.length} texture candidate(s):`, refs)
+  }
+  
   for (const raw of refs) {
     const candidate = normalizeSwgPath(raw)
     if (!candidate || seen.has(candidate)) continue
     seen.add(candidate)
     const source = await lookup(candidate)
-    if (source) return { path: candidate, source }
+    if (source) {
+      if (isTexture) console.log(`[Candidate Check] \u2713 Selected: ${candidate}`)
+      return { path: candidate, source }
+    }
   }
+  
+  if (isTexture) console.log(`[Candidate Check] \u2717 None of the candidates found`)
   return null
 }
 
@@ -2261,12 +2487,24 @@ function extractShaderStageTextureRefs(
   primaryMipmapFilter?: TextureFilterMode
   primaryMinificationFilter?: TextureFilterMode
   primaryMagnificationFilter?: TextureFilterMode
+  primaryScaleU?: number
+  primaryScaleV?: number
   secondaryTextures: string[]
   secondaryUvSetIndex: number
   secondaryAddressU?: TextureAddressMode
   secondaryAddressV?: TextureAddressMode
+  secondaryScaleU?: number
+  secondaryScaleV?: number
   normalAddressU?: TextureAddressMode
   normalAddressV?: TextureAddressMode
+  normalScaleU?: number
+  normalScaleV?: number
+  alphaTest: boolean
+  alphaReference: number
+  transparent: boolean
+  alphaBlend: boolean
+  effectTags: string[]
+  shaderDebugChunks?: string[]  // For debugging
 } {
   const normalizedPath = normalizeSwgPath(shaderPath)
   const cached = shaderStageRefsCache.get(normalizedPath)
@@ -2287,6 +2525,11 @@ function extractShaderStageTextureRefs(
     primaryMagnificationFilter: undefined,
     secondaryTextures: [] as string[],
     secondaryUvSetIndex: 0,
+    alphaTest: false,
+    alphaReference: 0,
+    transparent: false,
+    alphaBlend: false,
+    effectTags: [] as string[],
   }
   if (!root) return empty
 
@@ -2357,16 +2600,125 @@ function extractShaderStageTextureRefs(
   let primaryMipmapFilter: TextureFilterMode | undefined
   let primaryMinificationFilter: TextureFilterMode | undefined
   let primaryMagnificationFilter: TextureFilterMode | undefined
+  let primaryScaleU: number | undefined
+  let primaryScaleV: number | undefined
   let secondaryAddressU: TextureAddressMode | undefined
   let secondaryAddressV: TextureAddressMode | undefined
+  let secondaryScaleU: number | undefined
+  let secondaryScaleV: number | undefined
   let normalAddressU: TextureAddressMode | undefined
   let normalAddressV: TextureAddressMode | undefined
+  let normalScaleU: number | undefined
+  let normalScaleV: number | undefined
   let hasTxms = false
   let tcssPayloadsParsed = 0
   let tcssRecognizedAssignments = 0
   const tcssUniqueAssignmentKeys = new Set<string>()
+  let txmPrimaryUvSetFallback: number | undefined
+  let txmSecondaryUvSetFallback: number | undefined
+  let txmNormalUvSetFallback: number | undefined
+  
+  // Material properties
+  let alphaTest = false
+  let alphaReference = 0
+  let transparent = false
+  let alphaBlend = false
+  const effectTags: string[] = []
+  const shaderDebugChunks: string[] = []  // Capture all chunks for debugging
+  
+  // Capture chunk structure for debugging.
+  // SHT files are small (typically a few KB total). Show full hex for ALL chunks
+  // up to 4096 bytes so we never truncate the data needed to diagnose UV/sampler issues.
+  function captureChunkStructure(node: BinaryChunk, depth = 0) {
+    const indent = '  '.repeat(depth)
+    if (node.type) {
+      shaderDebugChunks.push(`${indent}${node.tag}:${node.type}`)
+    } else {
+      const dataSize = node.dataEnd - node.dataStart
+      const maxBytesToShow = 4096
+      if (dataSize > 0 && dataSize <= maxBytesToShow) {
+        const hexBytes: string[] = []
+        const asciiBytes: string[] = []
+        for (let i = node.dataStart; i < node.dataEnd; i++) {
+          const b = bytes[i]
+          hexBytes.push(b.toString(16).padStart(2, '0'))
+          asciiBytes.push(b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.')
+        }
+        shaderDebugChunks.push(`${indent}${node.tag} (${dataSize}B) [${hexBytes.join(' ')}] "${asciiBytes.join('')}"`)
+      } else {
+        shaderDebugChunks.push(`${indent}${node.tag} (${dataSize} bytes - truncated)`)
+      }
+    }
+    for (const child of node.children) {
+      captureChunkStructure(child, depth + 1)
+    }
+  }
+  captureChunkStructure(root)
+  
+  // Track what FORM chunks we encounter
+  const formChunks = new Set<string>()
+
+  const applyEffectTag = (raw: string): void => {
+    const tagValue = raw.trim().toUpperCase()
+    if (!tagValue || !/^[A-Z0-9_]{3,8}$/.test(tagValue)) return
+    if (!effectTags.includes(tagValue)) {
+      effectTags.push(tagValue)
+      console.log(`[Shader Effect] Found TAG: ${tagValue}`)
+    }
+
+    if (tagValue === 'ALPH' || tagValue === 'TRNS' || tagValue === 'BLND' || tagValue === 'TRANSPARENT') {
+      transparent = true
+      alphaBlend = true
+    }
+    if (tagValue === 'PNCH' || tagValue === 'PUNCHOUT') {
+      alphaTest = true
+      if (alphaReference === 0) alphaReference = 128
+    }
+    if (tagValue === 'ADDT' || tagValue === 'ADDITIVE' || tagValue === 'ADD') {
+      transparent = true
+      alphaBlend = true
+    }
+  }
 
   const visit = (node: BinaryChunk) => {
+    if (node.tag === 'FORM' && node.type) {
+      formChunks.add(node.type)
+      // ARVS = Alpha Reference Value Source. SHT files only include this FORM
+      // when the shader expects alpha blending against an existing surface
+      // (e.g. grunge overlays, glass, decals). Its presence is a definitive
+      // signal even if no textual TAG chunk is emitted.
+      if (node.type === 'ARVS') {
+        transparent = true
+        alphaBlend = true
+      }
+    }
+
+    // SHT references its effect via a NAME chunk at the top level. Effect
+    // file names follow the convention "effect\a_alpha*.eft", "effect\a_add*.eft",
+    // "effect\a_trans*.eft" for alpha/additive variants. Detect from the name
+    // so we don't have to also parse every .eft to learn the blend mode.
+    if (node.tag === 'NAME' && node.size >= 5 && node.size <= 128) {
+      let s = ''
+      for (let i = node.dataStart; i < node.dataEnd; i++) {
+        const b = bytes[i]
+        if (b === 0) break
+        if (b >= 0x20 && b <= 0x7e) s += String.fromCharCode(b)
+      }
+      const lower = s.toLowerCase()
+      if (lower.endsWith('.eft')) {
+        // Common alpha-blended effect families.
+        if (
+          lower.includes('a_alpha') ||
+          lower.includes('a_trans') ||
+          lower.includes('a_glass') ||
+          lower.includes('a_add')
+        ) {
+          transparent = true
+          alphaBlend = true
+        }
+      }
+    }
+
     if (node.tag === 'FORM' && node.type === 'TXMS') {
       hasTxms = true
       for (const txm of node.children) {
@@ -2384,6 +2736,7 @@ function extractShaderStageTextureRefs(
           let slotMipmapFilter: TextureFilterMode | undefined
           let slotMinificationFilter: TextureFilterMode | undefined
           let slotMagnificationFilter: TextureFilterMode | undefined
+          let slotUvSetFallback: number | undefined
           for (const child of versionForm.children) {
             if (child.tag === 'DATA' && child.size >= 4 && slotTag === '') {
               // First 4 bytes of DATA identify the slot (NIAM, LMRN, ATED, MVNE, CEPS, …).
@@ -2397,6 +2750,15 @@ function extractShaderStageTextureRefs(
               // TXM DATA layout (verified from template):
               // [0..3] Tag, [4] Placeholder, [5] AddressU, [6] AddressV,
               // [7] AddressW, [8] MipFilter, [9] MinFilter, [10] MagFilter
+              // [11+] Unknown - may contain UV mode/generation flags
+              
+              // Log full DATA payload for analysis
+              if (child.size > 11) {
+                const dataHex = Array.from(bytes.subarray(child.dataStart, child.dataStart + Math.min(child.size, 32)))
+                  .map(b => b.toString(16).padStart(2, '0')).join(' ')
+                console.log(`[Shader TXM DATA] ${rawSlotTag} size=${child.size} hex=[${dataHex}]`)
+              }
+              
               if (child.size >= 7) {
                 slotAddressU = decodeAddressMode(bytes[child.dataStart + 5])
                 slotAddressV = decodeAddressMode(bytes[child.dataStart + 6])
@@ -2404,6 +2766,13 @@ function extractShaderStageTextureRefs(
                   slotMipmapFilter = decodeFilterMode(bytes[child.dataStart + 8])
                   slotMinificationFilter = decodeFilterMode(bytes[child.dataStart + 9])
                   slotMagnificationFilter = decodeFilterMode(bytes[child.dataStart + 10])
+                }
+                if (child.size >= 12) {
+                  // Fallback UV set source: TXM DATA mode byte (slot-local).
+                  // This is used only when TCSS is absent/undecodable.
+                  const uvModeRaw = bytes[child.dataStart + 11]
+                  const uvSet = uvModeRaw & 0x07
+                  if (uvSet <= 7) slotUvSetFallback = uvSet
                 }
               } else if (child.size >= 10) {
                 // Legacy fallback for older assumptions.
@@ -2428,6 +2797,7 @@ function extractShaderStageTextureRefs(
               if (seenBySlot.MAIN.has(ref)) continue
               seenBySlot.MAIN.add(ref)
               mainTextures.push(ref)        // MAIN → primary diffuse
+              if (slotUvSetFallback !== undefined) txmPrimaryUvSetFallback ??= slotUvSetFallback
               primaryAddressU ??= slotAddressU
               primaryAddressV ??= slotAddressV
               primaryMipmapFilter ??= slotMipmapFilter
@@ -2437,12 +2807,14 @@ function extractShaderStageTextureRefs(
               if (seenBySlot.NRML.has(ref)) continue
               seenBySlot.NRML.add(ref)
               normalTextures.push(ref) // NRML → normal map
+              if (slotUvSetFallback !== undefined) txmNormalUvSetFallback ??= slotUvSetFallback
               normalAddressU ??= slotAddressU
               normalAddressV ??= slotAddressV
             } else if (slotTag === 'DETA') {
               if (seenBySlot.DETA.has(ref)) continue
               seenBySlot.DETA.add(ref)
               detailTextures.push(ref)  // DETA → detail overlay blend
+              if (slotUvSetFallback !== undefined) txmSecondaryUvSetFallback ??= slotUvSetFallback
               secondaryAddressU ??= slotAddressU
               secondaryAddressV ??= slotAddressV
             }
@@ -2490,9 +2862,12 @@ function extractShaderStageTextureRefs(
           const size = payload.length - startOffset
           if (size < 5 || size % 5 !== 0) return
           const entryCount = Math.floor(size / 5)
+          console.log(`[TCSS 5-byte] Parsing ${entryCount} 5-byte entries at offset ${startOffset} in shader ${shaderPath}`)
           for (let i = 0; i < entryCount; i += 1) {
             const off = startOffset + i * 5
             const rawTag = String.fromCharCode(payload[off], payload[off + 1], payload[off + 2], payload[off + 3])
+            const byte4 = payload[off + 4]
+            console.log(`[TCSS 5-byte] Entry ${i}: tag="${rawTag}" byte4=${byte4} (normalized: ${normalizeShaderSlotTag(rawTag)})`)
             if (applyTcssEntry(rawTag, payload[off + 4])) {
               applied = true
             }
@@ -2503,12 +2878,18 @@ function extractShaderStageTextureRefs(
           const size = payload.length - startOffset
           if (size < 8 || size % 8 !== 0) return
           const entryCount = Math.floor(size / 8)
+          console.log(`[TCSS 8-byte] Parsing ${entryCount} 8-byte entries at offset ${startOffset}`)
           for (let i = 0; i < entryCount; i += 1) {
             const off = startOffset + i * 8
             const rawTag = String.fromCharCode(payload[off], payload[off + 1], payload[off + 2], payload[off + 3])
             // Observed variants use either byte or uint32 for index.
             const uvLe = view.getUint32(off + 4, true)
             const uvBe = view.getUint32(off + 4, false)
+            const byte4 = payload[off + 4]
+            const byte5 = payload[off + 5]
+            const byte6 = payload[off + 6]
+            const byte7 = payload[off + 7]
+            console.log(`[TCSS 8-byte] Entry ${i}: tag="${rawTag}" bytes[4-7]=[${byte4}, ${byte5}, ${byte6}, ${byte7}] uvLe=${uvLe} uvBe=${uvBe}`)
             if (applyTcssEntry(rawTag, uvLe)) {
               applied = true
               continue
@@ -2524,6 +2905,17 @@ function extractShaderStageTextureRefs(
         parse5ByteEntries(4)
         parse8ByteEntries(0)
         parse8ByteEntries(4)
+
+        // Robust fallback: only use sliding token scan when structured layouts yielded nothing.
+        if (!applied) {
+          for (let off = 0; off + 4 < payload.length; off += 1) {
+            const rawTag = String.fromCharCode(payload[off], payload[off + 1], payload[off + 2], payload[off + 3])
+            const normalized = normalizeShaderSlotTag(rawTag)
+            if (normalized !== 'MAIN' && normalized !== 'DETA' && normalized !== 'NRML') continue
+            const uvIndexRaw = payload[off + 4]
+            if (applyTcssEntry(rawTag, uvIndexRaw)) applied = true
+          }
+        }
 
         return applied
       }
@@ -2543,12 +2935,147 @@ function extractShaderStageTextureRefs(
       }
     }
 
+    // Parse TCSC (Texture Coordinate Scale) - UV scale multipliers per texture stage
+    if (node.tag === 'FORM' && node.type === 'TCSC') {
+      console.log(`[TCSC] Found TCSC chunk in shader: ${shaderPath}`)
+      const parseTcscPayload = (payload: Uint8Array): void => {
+        const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength)
+        console.log(`[TCSC] Parsing payload, length: ${payload.length}`)
+        
+        // TCSC format: 4-byte tag + 4-byte float scaleU + 4-byte float scaleV (12 bytes per entry)
+        const parseEntries = (startOffset: number) => {
+          const size = payload.length - startOffset
+          if (size < 12 || size % 12 !== 0) {
+            console.log(`[TCSC] Size check failed at offset ${startOffset}: size=${size}, not divisible by 12`)
+            return
+          }
+          const entryCount = Math.floor(size / 12)
+          console.log(`[TCSC] Parsing ${entryCount} entries at offset ${startOffset}`)
+          for (let i = 0; i < entryCount; i += 1) {
+            const off = startOffset + i * 12
+            const rawTag = String.fromCharCode(payload[off], payload[off + 1], payload[off + 2], payload[off + 3])
+            const slotTag = normalizeShaderSlotTag(rawTag)
+            const scaleU = view.getFloat32(off + 4, false)  // Big-endian (SWG format)
+            const scaleV = view.getFloat32(off + 8, false)  // Big-endian (SWG format)
+            
+            console.log(`[TCSC] Entry ${i}: rawTag="${rawTag}" slotTag="${slotTag}" scaleU=${scaleU} scaleV=${scaleV}`)
+            
+            if (Number.isFinite(scaleU) && Number.isFinite(scaleV) && scaleU > 0 && scaleV > 0) {
+              if (slotTag === 'MAIN') {
+                primaryScaleU ??= scaleU
+                primaryScaleV ??= scaleV
+                console.log(`[TCSC] ✓ Assigned MAIN scales: U=${scaleU}, V=${scaleV}`)
+              } else if (slotTag === 'NRML') {
+                normalScaleU ??= scaleU
+                normalScaleV ??= scaleV
+                console.log(`[TCSC] ✓ Assigned NRML scales: U=${scaleU}, V=${scaleV}`)
+              } else if (slotTag === 'DETA') {
+                secondaryScaleU ??= scaleU
+                secondaryScaleV ??= scaleV
+                console.log(`[TCSC] ✓ Assigned DETA scales: U=${scaleU}, V=${scaleV}`)
+              }
+            } else {
+              console.log(`[TCSC] × Invalid scale values, skipping`)
+            }
+          }
+        }
+
+        // Try direct payload and common header-prefixed variants
+        parseEntries(0)
+        parseEntries(4)
+      }
+
+      // Walk the TCSC subtree and parse all non-FORM payload chunks
+      const stack = [...node.children]
+      while (stack.length > 0) {
+        const next = stack.pop()
+        if (!next) continue
+        if (next.tag === 'FORM') {
+          for (const child of next.children) stack.push(child)
+          continue
+        }
+        if (next.dataEnd <= next.dataStart || next.size < 12) continue
+        parseTcscPayload(bytes.subarray(next.dataStart, next.dataEnd))
+      }
+    }
+
+    // Parse ALPH (Alpha Test Reference) chunk
+    if (node.tag === 'DATA' && node.size >= 4) {
+      const parent = findParentChunk(root, node)
+      if (parent?.tag === 'FORM' && parent?.type === 'ALPH') {
+        // ALPH DATA contains alpha reference value (0-255)
+        const alphaRefValue = bytes[node.dataStart]
+        if (alphaRefValue > 0) {
+          alphaTest = true
+          alphaReference = alphaRefValue
+          console.log(`[Shader Alpha] Found ALPH chunk: reference=${alphaRefValue}`)
+        }
+      }
+    }
+
+    // Parse EFCT/TAG effect tags
+    if (node.tag === 'TAG ' && node.size === 4) {
+      const tagRaw = String.fromCharCode(
+        bytes[node.dataStart],
+        bytes[node.dataStart + 1],
+        bytes[node.dataStart + 2],
+        bytes[node.dataStart + 3]
+      )
+      applyEffectTag(tagRaw)
+    }
+
+    if (node.tag === 'DATA' && node.size >= 4) {
+      const parent = findParentChunk(root, node)
+      if (parent?.tag === 'FORM' && parent.type === 'EFCT') {
+        const payload = bytes.subarray(node.dataStart, node.dataEnd)
+        // EFCT payloads can encode 4-byte tag tokens and/or inline ASCII tag names.
+        for (let i = 0; i + 3 < payload.length; i += 4) {
+          const token = String.fromCharCode(payload[i], payload[i + 1], payload[i + 2], payload[i + 3])
+          applyEffectTag(token)
+        }
+
+        const ascii = extractAsciiStrings(
+          payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
+          3,
+        )
+        for (const str of ascii) {
+          applyEffectTag(str)
+        }
+      }
+    }
+
     for (const child of node.children) visit(child)
   }
 
+  // Helper to find parent chunk (simple implementation)
+  function findParentChunk(root: BinaryChunk, target: BinaryChunk): BinaryChunk | null {
+    function search(node: BinaryChunk): BinaryChunk | null {
+      for (const child of node.children) {
+        if (child === target) return node
+        const found = search(child)
+        if (found) return found
+      }
+      return null
+    }
+    return search(root)
+  }
+
   visit(root)
+
+  // Fallback UV set assignment from TXM DATA when TCSS is absent or undecodable.
+  if (tcssRecognizedAssignments === 0) {
+    if (txmPrimaryUvSetFallback !== undefined) primaryUvSetIndex = txmPrimaryUvSetFallback
+    if (txmSecondaryUvSetFallback !== undefined) secondaryUvSetIndex = txmSecondaryUvSetFallback
+    if (txmNormalUvSetFallback !== undefined) normalUvSetIndex = txmNormalUvSetFallback
+  }
+
   // normalUvSetIndex is recorded for future use but not yet wired into the result
   void normalUvSetIndex
+  
+  console.log(`[Shader Chunks] ${shaderPath} contains FORM chunks: ${Array.from(formChunks).join(', ')}`)
+  if (primaryScaleU || primaryScaleV || secondaryScaleU || secondaryScaleV || normalScaleU || normalScaleV) {
+    console.log(`[Shader Scales] Found scales - primary: [${primaryScaleU ?? 'none'}, ${primaryScaleV ?? 'none'}], secondary: [${secondaryScaleU ?? 'none'}, ${secondaryScaleV ?? 'none'}], normal: [${normalScaleU ?? 'none'}, ${normalScaleV ?? 'none'}]`)
+  }
 
   const out = {
     stageTextures: mainTextures,
@@ -2563,12 +3090,24 @@ function extractShaderStageTextureRefs(
     primaryMipmapFilter,
     primaryMinificationFilter,
     primaryMagnificationFilter,
+    primaryScaleU,
+    primaryScaleV,
     secondaryTextures: detailTextures,
     secondaryUvSetIndex,
     secondaryAddressU,
     secondaryAddressV,
+    secondaryScaleU,
+    secondaryScaleV,
     normalAddressU,
     normalAddressV,
+    normalScaleU,
+    normalScaleV,
+    alphaTest,
+    alphaReference,
+    transparent,
+    alphaBlend,
+    effectTags,
+    shaderDebugChunks,
   }
   shaderStageRefsCache.set(normalizedPath, out)
   return out
@@ -2614,14 +3153,20 @@ async function resolveMshPartMeshesWithTextures(
   normalTextureAddressU: (TextureAddressMode | undefined)[]
   normalTextureAddressV: (TextureAddressMode | undefined)[]
   primaryUvSetIndices: number[]
+  primaryScaleU: (number | undefined)[]
+  primaryScaleV: (number | undefined)[]
   secondaryTexturePaths: (string | undefined)[]
   secondaryTextureAddressU: (TextureAddressMode | undefined)[]
   secondaryTextureAddressV: (TextureAddressMode | undefined)[]
+  secondaryScaleU: (number | undefined)[]
+  secondaryScaleV: (number | undefined)[]
   secondaryUvSetIndices: number[]
   chunkTrace: (string | undefined)[]
+  effectPaths: (string | undefined)[]
 } | null> {
   const source = await lookup(meshPath)
   if (!source) return null
+  const strictDeclaredOnly = options.strictDeclaredOnly === true
 
   const buffer = await source.file.arrayBuffer()
   const bytes = new Uint8Array(buffer)
@@ -2652,11 +3197,16 @@ async function resolveMshPartMeshesWithTextures(
   const normalTextureAddressU: (TextureAddressMode | undefined)[] = []
   const normalTextureAddressV: (TextureAddressMode | undefined)[] = []
   const primaryUvSetIndices: number[] = []
+  const primaryScaleU: (number | undefined)[] = []
+  const primaryScaleV: (number | undefined)[] = []
   const secondaryTexturePaths: (string | undefined)[] = []
   const secondaryTextureAddressU: (TextureAddressMode | undefined)[] = []
   const secondaryTextureAddressV: (TextureAddressMode | undefined)[] = []
+  const secondaryScaleU: (number | undefined)[] = []
+  const secondaryScaleV: (number | undefined)[] = []
   const secondaryUvSetIndices: number[] = []
   const chunkTrace: (string | undefined)[] = []
+  const effectPaths: (string | undefined)[] = []
 
   for (const partForm of partForms) {
     const mesh = decodeStructuredMeshFromScope(bytes, partForm)
@@ -2670,6 +3220,8 @@ async function resolveMshPartMeshesWithTextures(
     let partTextureMipmapFilter: TextureFilterMode | undefined = undefined
     let partTextureMinificationFilter: TextureFilterMode | undefined = undefined
     let partTextureMagnificationFilter: TextureFilterMode | undefined = undefined
+    let partPrimaryScaleU: number | undefined = undefined
+    let partPrimaryScaleV: number | undefined = undefined
     let partNormalTexturePath: string | undefined = undefined
     let partNormalTextureAddressU: TextureAddressMode | undefined = undefined
     let partNormalTextureAddressV: TextureAddressMode | undefined = undefined
@@ -2677,6 +3229,8 @@ async function resolveMshPartMeshesWithTextures(
     let partSecondaryTexturePath: string | undefined = undefined
     let partSecondaryTextureAddressU: TextureAddressMode | undefined = undefined
     let partSecondaryTextureAddressV: TextureAddressMode | undefined = undefined
+    let partSecondaryScaleU: number | undefined = undefined
+    let partSecondaryScaleV: number | undefined = undefined
     let partSecondaryUvSetIndex = 0
     let partChunkTrace: string | undefined = undefined
     let partShaderPath: string | undefined = undefined
@@ -2722,10 +3276,14 @@ async function resolveMshPartMeshesWithTextures(
         })
       }
 
-      rankedShaderCandidates.sort((a, b) => {
-        if (a.score !== b.score) return b.score - a.score
-        return a.order - b.order
-      })
+      if (!strictDeclaredOnly) {
+        rankedShaderCandidates.sort((a, b) => {
+          if (a.score !== b.score) return b.score - a.score
+          return a.order - b.order
+        })
+      } else {
+        rankedShaderCandidates.sort((a, b) => a.order - b.order)
+      }
 
       for (const ranked of rankedShaderCandidates) {
         const textureHit = await resolveTextureFromShaderPath(ranked.path, lookup, options)
@@ -2736,6 +3294,8 @@ async function resolveMshPartMeshesWithTextures(
         partTextureMipmapFilter = textureHit.textureMipmapFilter
         partTextureMinificationFilter = textureHit.textureMinificationFilter
         partTextureMagnificationFilter = textureHit.textureMagnificationFilter
+        partPrimaryScaleU = textureHit.primaryScaleU
+        partPrimaryScaleV = textureHit.primaryScaleV
         partNormalTexturePath = textureHit.normalTexturePath
         partNormalTextureAddressU = textureHit.normalTextureAddressU
         partNormalTextureAddressV = textureHit.normalTextureAddressV
@@ -2743,6 +3303,8 @@ async function resolveMshPartMeshesWithTextures(
         partSecondaryTexturePath = textureHit.secondaryTexturePath
         partSecondaryTextureAddressU = textureHit.secondaryTextureAddressU
         partSecondaryTextureAddressV = textureHit.secondaryTextureAddressV
+        partSecondaryScaleU = textureHit.secondaryScaleU
+        partSecondaryScaleV = textureHit.secondaryScaleV
         partSecondaryUvSetIndex = textureHit.secondaryUvSetIndex ?? 0
         partChunkTrace = buildPartShaderTrace(
           ranked.path,
@@ -2764,6 +3326,8 @@ async function resolveMshPartMeshesWithTextures(
           partTextureMipmapFilter = textureHit.textureMipmapFilter
           partTextureMinificationFilter = textureHit.textureMinificationFilter
           partTextureMagnificationFilter = textureHit.textureMagnificationFilter
+          partPrimaryScaleU = textureHit.primaryScaleU
+          partPrimaryScaleV = textureHit.primaryScaleV
           partNormalTexturePath = textureHit.normalTexturePath
           partNormalTextureAddressU = textureHit.normalTextureAddressU
           partNormalTextureAddressV = textureHit.normalTextureAddressV
@@ -2771,6 +3335,8 @@ async function resolveMshPartMeshesWithTextures(
           partSecondaryTexturePath = textureHit.secondaryTexturePath
           partSecondaryTextureAddressU = textureHit.secondaryTextureAddressU
           partSecondaryTextureAddressV = textureHit.secondaryTextureAddressV
+          partSecondaryScaleU = textureHit.secondaryScaleU
+          partSecondaryScaleV = textureHit.secondaryScaleV
           partSecondaryUvSetIndex = textureHit.secondaryUvSetIndex ?? 0
           const shaderSource = await lookup(shaderCandidate)
           if (shaderSource) {
@@ -2802,11 +3368,37 @@ async function resolveMshPartMeshesWithTextures(
     normalTextureAddressU.push(partNormalTextureAddressU)
     normalTextureAddressV.push(partNormalTextureAddressV)
     primaryUvSetIndices.push(partPrimaryUvSetIndex)
+    primaryScaleU.push(partPrimaryScaleU)
+    primaryScaleV.push(partPrimaryScaleV)
     secondaryTexturePaths.push(partSecondaryTexturePath)
     secondaryTextureAddressU.push(partSecondaryTextureAddressU)
     secondaryTextureAddressV.push(partSecondaryTextureAddressV)
+    secondaryScaleU.push(partSecondaryScaleU)
+    secondaryScaleV.push(partSecondaryScaleV)
     secondaryUvSetIndices.push(partSecondaryUvSetIndex)
     chunkTrace.push(partChunkTrace)
+
+    // Resolve & cache the effect (.eft) file referenced by the part's shader so the
+    // surface-pick dump can show the effect chunks (which define UV transforms / DOT3 / blend ops).
+    let partEffectPath: string | undefined
+    if (partShaderPath) {
+      try {
+        const shaderSource = await lookup(partShaderPath)
+        if (shaderSource) {
+          const shaderBuffer = await shaderSource.file.arrayBuffer()
+          const shaderRefs = getResolvedRefCandidatesCached(partShaderPath, shaderBuffer)
+          const effectHit = await resolveFirstExistingByExt(shaderRefs, ['.eft'], lookup)
+          if (effectHit) {
+            partEffectPath = effectHit.path
+            const effectBuffer = await effectHit.source.file.arrayBuffer()
+            captureEffectDebugChunks(effectBuffer, effectHit.path)
+          }
+        }
+      } catch {
+        // Non-fatal: effect resolution is debug-only.
+      }
+    }
+    effectPaths.push(partEffectPath)
   }
 
   if (parts.length === 0) return null
@@ -2823,11 +3415,16 @@ async function resolveMshPartMeshesWithTextures(
     normalTextureAddressU,
     normalTextureAddressV,
     primaryUvSetIndices,
+    primaryScaleU,
+    primaryScaleV,
     secondaryTexturePaths,
     secondaryTextureAddressU,
     secondaryTextureAddressV,
+    secondaryScaleU,
+    secondaryScaleV,
     secondaryUvSetIndices,
     chunkTrace,
+    effectPaths,
   }
 }
 
@@ -2843,6 +3440,8 @@ async function resolveTextureFromShaderPath(
   textureMipmapFilter?: TextureFilterMode
   textureMinificationFilter?: TextureFilterMode
   textureMagnificationFilter?: TextureFilterMode
+  primaryScaleU?: number
+  primaryScaleV?: number
   normalTexturePath?: string
   normalTextureSourceLabel?: string
   normalTextureAddressU?: TextureAddressMode
@@ -2852,6 +3451,8 @@ async function resolveTextureFromShaderPath(
   secondaryUvSetIndex: number
   secondaryTextureAddressU?: TextureAddressMode
   secondaryTextureAddressV?: TextureAddressMode
+  secondaryScaleU?: number
+  secondaryScaleV?: number
 } | null> {
   const cacheKey = normalizeSwgPath(shaderPath)
   const cached = shaderTextureResolutionCache.get(cacheKey)
@@ -2865,17 +3466,24 @@ async function resolveTextureFromShaderPath(
     const shaderRefs = getResolvedRefCandidatesCached(shaderPath, shaderBuffer)
 
     const stageRefs = extractShaderStageTextureRefs(shaderBuffer, shaderPath)
+    console.log(`[Texture Debug] Shader: ${shaderPath}`)
+    console.log(`[Texture Debug] Stage textures (MAIN):`, stageRefs.stageTextures)
+    console.log(`[Texture Debug] Stage normals (NRML):`, stageRefs.stageNormals)
+    console.log(`[Texture Debug] Secondary textures (ATED):`, stageRefs.secondaryTextures)
     // stageTextures/stageNormals are slot-type–identified (NIAM/LMRN from DATA bytes).
     // No filename heuristic filtering needed — slot type IS the classification.
     const stageNormalHit = await resolveFirstExistingInOrder(stageRefs.stageNormals, lookup)
     const stageDiffuseHit = await resolveFirstExistingInOrder(stageRefs.stageTextures, lookup)
     if (stageDiffuseHit) {
+      console.log(`[Texture Debug] ✓ Resolved MAIN texture: ${stageDiffuseHit.path}`)
+      if (stageNormalHit) console.log(`[Texture Debug] ✓ Resolved NRML texture: ${stageNormalHit.path}`)
       // Resolve secondary (ATED/detail) blend texture when present.
       // No theme-mismatch filter here — ATED detail textures like impl_floor_a_dirt_4way.dds
       // are explicitly identified by slot type and are always intentional.
       const secondaryHit = stageRefs.secondaryTextures.length > 0
         ? await resolveFirstExistingInOrder(stageRefs.secondaryTextures, lookup)
         : null
+      if (secondaryHit) console.log(`[Texture Debug] ✓ Resolved ATED texture: ${secondaryHit.path}`)
       return {
         texturePath: stageDiffuseHit.path,
         textureSourceLabel: stageDiffuseHit.source.sourceLabel,
@@ -2884,6 +3492,8 @@ async function resolveTextureFromShaderPath(
         textureMipmapFilter: stageRefs.primaryMipmapFilter,
         textureMinificationFilter: stageRefs.primaryMinificationFilter,
         textureMagnificationFilter: stageRefs.primaryMagnificationFilter,
+        primaryScaleU: stageRefs.primaryScaleU,
+        primaryScaleV: stageRefs.primaryScaleV,
         normalTexturePath: stageNormalHit?.path,
         normalTextureSourceLabel: stageNormalHit?.source.sourceLabel,
         normalTextureAddressU: stageRefs.normalAddressU,
@@ -2893,13 +3503,19 @@ async function resolveTextureFromShaderPath(
         secondaryUvSetIndex: stageRefs.secondaryUvSetIndex,
         secondaryTextureAddressU: stageRefs.secondaryAddressU,
         secondaryTextureAddressV: stageRefs.secondaryAddressV,
+        secondaryScaleU: stageRefs.secondaryScaleU,
+        secondaryScaleV: stageRefs.secondaryScaleV,
       }
     }
 
     // If TXMS exists in the shader, treat stage parsing as authoritative.
     // Do not fall through to declared/effect heuristics, which can pick unrelated textures.
-    if (stageRefs.hasTxms) return null
+    if (stageRefs.hasTxms) {
+      console.log(`[Texture Debug] Shader has TXMS but no valid MAIN texture found`)
+      return null
+    }
 
+    console.log(`[Texture Debug] No TXMS found, checking declared texture refs...`)
     const declaredTextureRefs = extractShaderDeclaredTextureRefs(shaderBuffer, shaderPath)
     const declaredDiffuse = declaredTextureRefs
       .filter((value) => value.slot === 'diffuse')
@@ -2912,6 +3528,8 @@ async function resolveTextureFromShaderPath(
 
     const declaredDiffuseHit = await resolveFirstExistingInOrder(declaredDiffuse, lookup)
     if (declaredDiffuseHit) {
+      console.log(`[Texture Debug] ✓ Resolved declared diffuse: ${declaredDiffuseHit.path}`)
+      if (declaredNormalHit) console.log(`[Texture Debug] ✓ Resolved declared normal: ${declaredNormalHit.path}`)
       return {
         texturePath: declaredDiffuseHit.path,
         textureSourceLabel: declaredDiffuseHit.source.sourceLabel,
@@ -2922,8 +3540,13 @@ async function resolveTextureFromShaderPath(
       }
     }
 
+    console.log(`[Texture Debug] No declared textures, checking effect file...`)
     const effectHit = await resolveFirstExistingByExt(shaderRefs, ['.eft'], lookup)
-    if (!effectHit) return null
+    if (!effectHit) {
+      console.log(`[Texture Debug] No effect file found`)
+      return null
+    }
+    console.log(`[Texture Debug] Found effect: ${effectHit.path}`)
 
     const effectBuffer = await effectHit.source.file.arrayBuffer()
     const declaredEffectRefs = extractEffectDeclaredTextureRefs(effectBuffer, effectHit.path)
@@ -2937,7 +3560,12 @@ async function resolveTextureFromShaderPath(
     const declaredEffectNormalHit = await resolveFirstExistingInOrder(declaredEffectNormal, lookup)
 
     const effectTextureHit = await resolveFirstExistingInOrder(declaredEffectDiffuse, lookup)
-    if (!effectTextureHit) return null
+    if (!effectTextureHit) {
+      console.log(`[Texture Debug] No effect texture found`)
+      return null
+    }
+    console.log(`[Texture Debug] ✓ Resolved effect texture: ${effectTextureHit.path}`)
+    if (declaredEffectNormalHit) console.log(`[Texture Debug] ✓ Resolved effect normal: ${declaredEffectNormalHit.path}`)
 
     return {
       texturePath: effectTextureHit.path,
@@ -3027,11 +3655,14 @@ interface DecodedMeshHit {
   meshPartNormalTextureAddressU?: (TextureAddressMode | undefined)[]
   meshPartNormalTextureAddressV?: (TextureAddressMode | undefined)[]
   meshPartPrimaryUvSetIndices?: number[]
+  meshPartPrimaryScaleU?: (number | undefined)[]
+  meshPartPrimaryScaleV?: (number | undefined)[]
   meshPartSecondaryTexturePaths?: (string | undefined)[]
   meshPartSecondaryTextureAddressU?: (TextureAddressMode | undefined)[]
   meshPartSecondaryTextureAddressV?: (TextureAddressMode | undefined)[]
   meshPartSecondaryUvSetIndices?: number[]
   meshPartChunkTrace?: (string | undefined)[]
+  meshPartEffectPaths?: (string | undefined)[]
 }
 
 interface ParsedInlineString {
@@ -3162,7 +3793,10 @@ function decodeCellDataTransformMatrix(dataPayload: Uint8Array, minOffset = 0): 
   return undefined
 }
 
-function extractCellMeshRefFromDataChunk(dataPayload: Uint8Array): { meshRef: string; matrix?: number[] } | null {
+function extractCellMeshRefFromDataChunk(
+  dataPayload: Uint8Array,
+  includeOutsideWorld = false,
+): { meshRef: string; matrix?: number[] } | null {
   // Vanguard source parity for CELL DATA:
   // int numberOfPortals; byte unk; string name; string meshFile; byte floorFlag; [string floorFile]
   if (dataPayload.length < 8) return null
@@ -3181,8 +3815,8 @@ function extractCellMeshRefFromDataChunk(dataPayload: Uint8Array): { meshRef: st
     const meshFile = meshRead.value.trim()
     if (!meshFile || !/\.(?:apt|msh|lod|cmp)$/i.test(meshFile)) continue
 
-    // Skip likely outside/world cell meshes to avoid stacking exterior shell as interior.
-    if (/(^|[_/])(world|outside)([_/]|$)/i.test(cellName)) {
+    // Interior assembly should skip outside/world cells; exterior traversal may include them.
+    if (!includeOutsideWorld && /(^|[_/])(world|outside)([_/]|$)/i.test(cellName)) {
       continue
     }
 
@@ -3209,7 +3843,11 @@ function extractCellMeshRefFromDataChunk(dataPayload: Uint8Array): { meshRef: st
   return null
 }
 
-function extractPobCellAppearanceRefs(buffer: ArrayBuffer, basePath: string): PobCellAppearanceEntry[] {
+function extractPobCellAppearanceRefs(
+  buffer: ArrayBuffer,
+  basePath: string,
+  includeOutsideWorld = false,
+): PobCellAppearanceEntry[] {
   const bytes = new Uint8Array(buffer)
   const root = parseBigEndianChunks(bytes)
   if (!root) return []
@@ -3221,7 +3859,7 @@ function extractPobCellAppearanceRefs(buffer: ArrayBuffer, basePath: string): Po
     const dataChunk = flattenChunkSubtree(cell).find((chunk) => chunk.tag === 'DATA' && chunk.size >= 8)
     if (!dataChunk) continue
     const payload = bytes.subarray(dataChunk.dataStart, dataChunk.dataEnd)
-    const parsed = extractCellMeshRefFromDataChunk(payload)
+    const parsed = extractCellMeshRefFromDataChunk(payload, includeOutsideWorld)
     if (!parsed) continue
 
     const selectedRef = resolveRefCandidates(basePath, parsed.meshRef)
@@ -3308,12 +3946,15 @@ async function resolveMergedDecodedMeshes(
   const partNormalTextureAddressU: (TextureAddressMode | undefined)[] = []
   const partNormalTextureAddressV: (TextureAddressMode | undefined)[] = []
   const partPrimaryUvSetIndices: number[] = []
+  const partPrimaryScaleU: (number | undefined)[] = []
+  const partPrimaryScaleV: (number | undefined)[] = []
   const partSecondaryTexturePaths: (string | undefined)[] = []
   const partSecondaryTextureAddressU: (TextureAddressMode | undefined)[] = []
   const partSecondaryTextureAddressV: (TextureAddressMode | undefined)[] = []
   const partSecondaryUvSetIndices: number[] = []
   const partChunkTrace: (string | undefined)[] = []
   const partShaderPaths: (string | undefined)[] = []
+  const partEffectPaths: (string | undefined)[] = []
   const partPaths: string[] = []
   const labels: string[] = []
   const seen = new Set<string>()
@@ -3345,12 +3986,15 @@ async function resolveMergedDecodedMeshes(
           partNormalTextureAddressU.push(strictHit.normalTextureAddressU[i])
           partNormalTextureAddressV.push(strictHit.normalTextureAddressV[i])
           partPrimaryUvSetIndices.push(strictHit.primaryUvSetIndices[i] ?? 0)
+          partPrimaryScaleU.push(strictHit.primaryScaleU[i])
+          partPrimaryScaleV.push(strictHit.primaryScaleV[i])
           partSecondaryTexturePaths.push(strictHit.secondaryTexturePaths[i])
           partSecondaryTextureAddressU.push(strictHit.secondaryTextureAddressU[i])
           partSecondaryTextureAddressV.push(strictHit.secondaryTextureAddressV[i])
           partSecondaryUvSetIndices.push(strictHit.secondaryUvSetIndices[i] ?? 0)
           partChunkTrace.push(strictHit.chunkTrace[i])
           partShaderPaths.push(strictHit.shaderPaths[i])
+          partEffectPaths.push(strictHit.effectPaths[i])
           partPaths.push(norm)
         }
         const src = await lookup(norm)
@@ -3359,8 +4003,44 @@ async function resolveMergedDecodedMeshes(
       }
     }
 
-    const hit = await resolveBestDecodedMesh([entry.ref], lookup)
+    const hit = await resolveBestDecodedMesh([entry.ref], lookup, true, true)
     if (!hit) continue
+
+    // If a non-MSH reference (APT/LOD/CMP/POB) resolved to an MSH path,
+    // run strict MSH part extraction on that resolved path so per-part
+    // shader/texture bindings are preserved instead of collapsing to a
+    // single mesh-level fallback texture.
+    if (ext(hit.path) === '.msh') {
+      const resolvedStrictHit = await resolveMshPartMeshesWithTextures(hit.path, lookup)
+      if (resolvedStrictHit && resolvedStrictHit.parts.length > 0) {
+        for (let i = 0; i < resolvedStrictHit.parts.length; i += 1) {
+          parts.push(applyCellPartTransform(resolvedStrictHit.parts[i], matrix))
+          partTexturePaths.push(resolvedStrictHit.texturePaths[i] ?? '')
+          partTextureAddressU.push(resolvedStrictHit.textureAddressU[i])
+          partTextureAddressV.push(resolvedStrictHit.textureAddressV[i])
+          partTextureMipmapFilter.push(resolvedStrictHit.textureMipmapFilter[i])
+          partTextureMinificationFilter.push(resolvedStrictHit.textureMinificationFilter[i])
+          partTextureMagnificationFilter.push(resolvedStrictHit.textureMagnificationFilter[i])
+          partNormalTexturePaths.push(resolvedStrictHit.normalTexturePaths[i])
+          partNormalTextureAddressU.push(resolvedStrictHit.normalTextureAddressU[i])
+          partNormalTextureAddressV.push(resolvedStrictHit.normalTextureAddressV[i])
+          partPrimaryUvSetIndices.push(resolvedStrictHit.primaryUvSetIndices[i] ?? 0)
+          partPrimaryScaleU.push(resolvedStrictHit.primaryScaleU[i])
+          partPrimaryScaleV.push(resolvedStrictHit.primaryScaleV[i])
+          partSecondaryTexturePaths.push(resolvedStrictHit.secondaryTexturePaths[i])
+          partSecondaryTextureAddressU.push(resolvedStrictHit.secondaryTextureAddressU[i])
+          partSecondaryTextureAddressV.push(resolvedStrictHit.secondaryTextureAddressV[i])
+          partSecondaryUvSetIndices.push(resolvedStrictHit.secondaryUvSetIndices[i] ?? 0)
+          partChunkTrace.push(resolvedStrictHit.chunkTrace[i])
+          partShaderPaths.push(resolvedStrictHit.shaderPaths[i])
+          partEffectPaths.push(resolvedStrictHit.effectPaths[i])
+          partPaths.push(hit.path)
+        }
+        if (!labels.includes(hit.sourceLabel)) labels.push(hit.sourceLabel)
+        continue
+      }
+    }
+
     const resolvedPathKey = `${normalizeSwgPath(hit.path)}|${matrixSignature(matrix)}`
     if (seenResolvedMeshPaths.has(resolvedPathKey)) continue
     seenResolvedMeshPaths.add(resolvedPathKey)
@@ -3381,32 +4061,43 @@ async function resolveMergedDecodedMeshes(
         partNormalTextureAddressU.push(hit.meshPartNormalTextureAddressU?.[i])
         partNormalTextureAddressV.push(hit.meshPartNormalTextureAddressV?.[i])
         partPrimaryUvSetIndices.push(hit.meshPartPrimaryUvSetIndices?.[i] ?? 0)
+        partPrimaryScaleU.push(hit.meshPartPrimaryScaleU?.[i])
+        partPrimaryScaleV.push(hit.meshPartPrimaryScaleV?.[i])
         partSecondaryTexturePaths.push(hit.meshPartSecondaryTexturePaths?.[i])
         partSecondaryTextureAddressU.push(hit.meshPartSecondaryTextureAddressU?.[i])
         partSecondaryTextureAddressV.push(hit.meshPartSecondaryTextureAddressV?.[i])
         partSecondaryUvSetIndices.push(hit.meshPartSecondaryUvSetIndices?.[i] ?? 0)
         partChunkTrace.push(hit.meshPartChunkTrace?.[i])
         partShaderPaths.push(hit.meshPartShaderPaths?.[i])
+        partEffectPaths.push(hit.meshPartEffectPaths?.[i])
         partPaths.push(hit.path)
       }
     } else {
+      const meshOnlyTextureHit = await resolveTextureFromMeshShaderChain(
+        [norm, hit.path],
+        lookup,
+        { strictDeclaredOnly: true },
+      )
       parts.push(applyCellPartTransform(hit.mesh, matrix))
-      partTexturePaths.push(hit.meshPartTexturePaths?.[0] ?? '')
-      partTextureAddressU.push(hit.meshPartTextureAddressU?.[0])
-      partTextureAddressV.push(hit.meshPartTextureAddressV?.[0])
-      partTextureMipmapFilter.push(hit.meshPartTextureMipmapFilter?.[0])
-      partTextureMinificationFilter.push(hit.meshPartTextureMinificationFilter?.[0])
-      partTextureMagnificationFilter.push(hit.meshPartTextureMagnificationFilter?.[0])
-      partNormalTexturePaths.push(hit.meshPartNormalTexturePaths?.[0])
-      partNormalTextureAddressU.push(hit.meshPartNormalTextureAddressU?.[0])
-      partNormalTextureAddressV.push(hit.meshPartNormalTextureAddressV?.[0])
+      partTexturePaths.push(hit.meshPartTexturePaths?.[0] ?? meshOnlyTextureHit?.texturePath ?? '')
+      partTextureAddressU.push(hit.meshPartTextureAddressU?.[0] ?? meshOnlyTextureHit?.textureAddressU)
+      partTextureAddressV.push(hit.meshPartTextureAddressV?.[0] ?? meshOnlyTextureHit?.textureAddressV)
+      partTextureMipmapFilter.push(hit.meshPartTextureMipmapFilter?.[0] ?? meshOnlyTextureHit?.textureMipmapFilter)
+      partTextureMinificationFilter.push(hit.meshPartTextureMinificationFilter?.[0] ?? meshOnlyTextureHit?.textureMinificationFilter)
+      partTextureMagnificationFilter.push(hit.meshPartTextureMagnificationFilter?.[0] ?? meshOnlyTextureHit?.textureMagnificationFilter)
+      partNormalTexturePaths.push(hit.meshPartNormalTexturePaths?.[0] ?? meshOnlyTextureHit?.normalTexturePath)
+      partNormalTextureAddressU.push(hit.meshPartNormalTextureAddressU?.[0] ?? meshOnlyTextureHit?.normalTextureAddressU)
+      partNormalTextureAddressV.push(hit.meshPartNormalTextureAddressV?.[0] ?? meshOnlyTextureHit?.normalTextureAddressV)
       partPrimaryUvSetIndices.push(hit.meshPartPrimaryUvSetIndices?.[0] ?? 0)
+      partPrimaryScaleU.push(hit.meshPartPrimaryScaleU?.[0])
+      partPrimaryScaleV.push(hit.meshPartPrimaryScaleV?.[0])
       partSecondaryTexturePaths.push(hit.meshPartSecondaryTexturePaths?.[0])
       partSecondaryTextureAddressU.push(hit.meshPartSecondaryTextureAddressU?.[0])
       partSecondaryTextureAddressV.push(hit.meshPartSecondaryTextureAddressV?.[0])
       partSecondaryUvSetIndices.push(hit.meshPartSecondaryUvSetIndices?.[0] ?? 0)
       partChunkTrace.push(hit.meshPartChunkTrace?.[0])
       partShaderPaths.push(hit.meshPartShaderPaths?.[0])
+      partEffectPaths.push(hit.meshPartEffectPaths?.[0])
       partPaths.push(hit.path)
     }
 
@@ -3431,6 +4122,8 @@ async function resolveMergedDecodedMeshes(
     meshPartNormalTextureAddressU: partNormalTextureAddressU,
     meshPartNormalTextureAddressV: partNormalTextureAddressV,
     meshPartPrimaryUvSetIndices: partPrimaryUvSetIndices,
+    meshPartPrimaryScaleU: partPrimaryScaleU,
+    meshPartPrimaryScaleV: partPrimaryScaleV,
     meshPartSecondaryTexturePaths: partSecondaryTexturePaths,
     meshPartSecondaryTextureAddressU: partSecondaryTextureAddressU,
     meshPartSecondaryTextureAddressV: partSecondaryTextureAddressV,
@@ -3683,6 +4376,7 @@ function sanitizeMesh(mesh: PreviewMeshData): PreviewMeshData | null {
     uvs1: hasUvs1 ? cleanUvs1 : undefined,
     uvSets: cleanUvSets.length > 0 ? cleanUvSets : undefined,
     hasUvChannel: mesh.hasUvChannel,
+    decodeDebug: mesh.decodeDebug,
   }
 }
 
@@ -3816,6 +4510,61 @@ function buildLodSiblingMeshCandidates(lodPath: string): string[] {
 
   return out
 }
+
+function extractLodMeshRefs(buffer: ArrayBuffer, basePath?: string): string[] {
+  const refs = new Set<string>()
+  const bytes = new Uint8Array(buffer)
+  const base = basePath ? normalizeSwgPath(basePath) : ''
+
+  const addRef = (raw: string) => {
+    const trimmed = raw.trim()
+    if (!trimmed) return
+    const resolved = resolveRefCandidates(base, trimmed)
+    for (const candidate of resolved) {
+      if (ext(candidate) === '.msh') refs.add(candidate)
+    }
+  }
+
+  try {
+    const root = parseIff(buffer)
+    const stack: IffChunk[] = [root]
+    while (stack.length > 0) {
+      const node = stack.pop()
+      if (!node) continue
+      for (const child of node.children) stack.push(child)
+
+      if (!node.data || node.data.length === 0) continue
+
+      if (node.tag === 'NAME') {
+        const parsed = parseInlineSwgString(node.data)
+        if (parsed) addRef(parsed)
+      }
+
+      // Some LOD variants store path-like strings in non-NAME leaves.
+      const ascii = extractAsciiStrings(
+        node.data.buffer.slice(node.data.byteOffset, node.data.byteOffset + node.data.byteLength),
+        6,
+      )
+      for (const text of ascii) {
+        if (/\.(?:msh)$/i.test(text)) addRef(text)
+      }
+    }
+  } catch {
+    // Fall back to raw buffer scan only if structured parse fails.
+  }
+
+  if (refs.size === 0) {
+    const decoder = new TextDecoder('utf-8', { fatal: false })
+    const fullText = decoder.decode(bytes)
+    const meshMatches = fullText.match(/[a-z0-9_./\\-]+\.msh/gi)
+    if (meshMatches) {
+      for (const match of meshMatches) addRef(match)
+    }
+  }
+
+  return Array.from(refs)
+}
+
 
 function parseTrailingLevel(path: string): number {
   const lower = normalizeSwgPath(path)
@@ -4068,7 +4817,7 @@ async function resolveCmpCompositeMesh(
   const partPaths: string[] = []
 
   for (const entry of entries) {
-    const hit = await resolveBestDecodedMesh([entry.ref], lookup, false)
+    const hit = await resolveBestDecodedMesh([entry.ref], lookup, false, true)
     if (!hit?.mesh) continue
     const transformed = applyCmpPartTransform(hit.mesh, entry.matrix)
     const normalized = normalizeCandidateMesh(transformed)
@@ -4122,6 +4871,12 @@ async function collectSieChainMeshRefs(
     const refs = getResolvedRefCandidatesCached(next.path, buffer)
 
     if (nextExt === '.lod') {
+      // Parse LOD file to extract actual mesh references
+      const lodRefs = extractLodMeshRefs(buffer, next.path)
+      for (const lodRef of lodRefs) {
+        refs.push(lodRef)
+      }
+      // Also try filename-based guessing as fallback
       for (const sibling of buildLodSiblingMeshCandidates(next.path)) {
         refs.push(sibling)
       }
@@ -4132,6 +4887,74 @@ async function collectSieChainMeshRefs(
       if (refExt === '.msh') {
         meshes.add(ref)
       } else if (['.pob', '.lod', '.cmp', '.apt'].includes(refExt)) {
+        queue.push({ path: ref, depth: next.depth + 1 })
+      }
+    }
+  }
+
+  return Array.from(meshes)
+}
+
+async function collectDeclaredMeshRefs(
+  roots: string[],
+  lookup: RepositoryLookup,
+  maxDepth = 7,
+): Promise<string[]> {
+  const queue: Array<{ path: string; depth: number }> = roots
+    .map((value) => normalizeSwgPath(value))
+    .filter(Boolean)
+    .map((path) => ({ path, depth: 0 }))
+  const visited = new Set<string>()
+  const meshes = new Set<string>()
+
+  while (queue.length > 0) {
+    const next = queue.shift()
+    if (!next) break
+    if (visited.has(next.path)) continue
+    visited.add(next.path)
+
+    const nextExt = ext(next.path)
+    if (nextExt === '.msh') {
+      meshes.add(next.path)
+      continue
+    }
+
+    if (next.depth >= maxDepth) continue
+    if (!['.pob', '.apt', '.lod', '.cmp', '.iff'].includes(nextExt)) continue
+
+    const source = await lookup(next.path)
+    if (!source) continue
+
+    const buffer = await source.file.arrayBuffer()
+    const refs = getResolvedRefCandidatesCached(next.path, buffer)
+
+    if (nextExt === '.apt') {
+      const detailRef = extractDtlLastChildRef(buffer, next.path)
+      if (detailRef) refs.push(detailRef)
+    }
+
+    if (nextExt === '.cmp') {
+      const cmpEntries = extractCmpPartEntries(buffer, next.path)
+      for (const entry of cmpEntries) refs.push(entry.ref)
+    }
+
+    if (nextExt === '.pob') {
+      // Exterior chain must include world/outside CELL references for full shell/roof assembly.
+      const pobCellRefs = extractPobCellAppearanceRefs(buffer, next.path, true)
+      for (const entry of pobCellRefs) refs.push(entry.ref)
+    }
+
+    if (nextExt === '.lod') {
+      // Deterministic: only explicit NAME references extracted from LOD content.
+      const lodRefs = extractLodMeshRefs(buffer, next.path)
+      for (const lodRef of lodRefs) refs.push(lodRef)
+    }
+
+    for (const ref of refs) {
+      const refExt = ext(ref)
+      if (refExt === '.msh') {
+        meshes.add(ref)
+      } else if (['.pob', '.apt', '.lod', '.cmp', '.iff'].includes(refExt)) {
         queue.push({ path: ref, depth: next.depth + 1 })
       }
     }
@@ -4159,12 +4982,15 @@ async function resolveSieCompositeMesh(
   const partNormalTextureAddressU: (TextureAddressMode | undefined)[] = []
   const partNormalTextureAddressV: (TextureAddressMode | undefined)[] = []
   const partPrimaryUvSetIndices: number[] = []
+  const partPrimaryScaleU: (number | undefined)[] = []
+  const partPrimaryScaleV: (number | undefined)[] = []
   const partSecondaryTexturePaths: (string | undefined)[] = []
   const partSecondaryTextureAddressU: (TextureAddressMode | undefined)[] = []
   const partSecondaryTextureAddressV: (TextureAddressMode | undefined)[] = []
   const partSecondaryUvSetIndices: number[] = []
   const partChunkTrace: (string | undefined)[] = []
   const partShaderPaths: (string | undefined)[] = []
+  const partEffectPaths: (string | undefined)[] = []
   let sourceLabel = ''
 
   for (const path of preferredRefs) {
@@ -4185,12 +5011,15 @@ async function resolveSieCompositeMesh(
         partNormalTextureAddressU.push(partHit.normalTextureAddressU[i])
         partNormalTextureAddressV.push(partHit.normalTextureAddressV[i])
         partPrimaryUvSetIndices.push(partHit.primaryUvSetIndices[i] ?? 0)
+        partPrimaryScaleU.push(partHit.primaryScaleU[i])
+        partPrimaryScaleV.push(partHit.primaryScaleV[i])
         partSecondaryTexturePaths.push(partHit.secondaryTexturePaths[i])
         partSecondaryTextureAddressU.push(partHit.secondaryTextureAddressU[i])
         partSecondaryTextureAddressV.push(partHit.secondaryTextureAddressV[i])
         partSecondaryUvSetIndices.push(partHit.secondaryUvSetIndices[i] ?? 0)
         partChunkTrace.push(partHit.chunkTrace[i])
         partShaderPaths.push(partHit.shaderPaths[i])
+        partEffectPaths.push(partHit.effectPaths[i])
       }
       continue
     }
@@ -4214,12 +5043,15 @@ async function resolveSieCompositeMesh(
     partNormalTextureAddressU.push(partTextureHit?.normalTextureAddressU)
     partNormalTextureAddressV.push(partTextureHit?.normalTextureAddressV)
     partPrimaryUvSetIndices.push(0)
+    partPrimaryScaleU.push(undefined)
+    partPrimaryScaleV.push(undefined)
     partSecondaryTexturePaths.push(undefined)
     partSecondaryTextureAddressU.push(undefined)
     partSecondaryTextureAddressV.push(undefined)
     partSecondaryUvSetIndices.push(0)
     partChunkTrace.push(undefined)
     partShaderPaths.push(partTextureHit?.shaderPath)
+    partEffectPaths.push(undefined)
   }
 
   const merged = combineMeshes(parts)
@@ -4241,12 +5073,15 @@ async function resolveSieCompositeMesh(
     meshPartNormalTextureAddressU: partNormalTextureAddressU,
     meshPartNormalTextureAddressV: partNormalTextureAddressV,
     meshPartPrimaryUvSetIndices: partPrimaryUvSetIndices,
+    meshPartPrimaryScaleU: partPrimaryScaleU,
+    meshPartPrimaryScaleV: partPrimaryScaleV,
     meshPartSecondaryTexturePaths: partSecondaryTexturePaths,
     meshPartSecondaryTextureAddressU: partSecondaryTextureAddressU,
     meshPartSecondaryTextureAddressV: partSecondaryTextureAddressV,
     meshPartSecondaryUvSetIndices: partSecondaryUvSetIndices,
     meshPartChunkTrace: partChunkTrace,
     meshPartShaderPaths: partShaderPaths,
+    meshPartEffectPaths: partEffectPaths,
   }
 }
 
@@ -4269,12 +5104,15 @@ async function resolveKnownPalaceComposite(
   const partNormalTextureAddressU: (TextureAddressMode | undefined)[] = []
   const partNormalTextureAddressV: (TextureAddressMode | undefined)[] = []
   const partPrimaryUvSetIndices: number[] = []
+  const partPrimaryScaleU: (number | undefined)[] = []
+  const partPrimaryScaleV: (number | undefined)[] = []
   const partSecondaryTexturePaths: (string | undefined)[] = []
   const partSecondaryTextureAddressU: (TextureAddressMode | undefined)[] = []
   const partSecondaryTextureAddressV: (TextureAddressMode | undefined)[] = []
   const partSecondaryUvSetIndices: number[] = []
   const partChunkTrace: (string | undefined)[] = []
   const partShaderPaths: (string | undefined)[] = []
+  const partEffectPaths: (string | undefined)[] = []
   let sourceLabel = ''
 
   // SIE log shows this family is componentized as c0..c9 with l-level variants.
@@ -4308,12 +5146,15 @@ async function resolveKnownPalaceComposite(
         partNormalTextureAddressU.push(partHit.normalTextureAddressU[i])
         partNormalTextureAddressV.push(partHit.normalTextureAddressV[i])
         partPrimaryUvSetIndices.push(partHit.primaryUvSetIndices[i] ?? 0)
+        partPrimaryScaleU.push(partHit.primaryScaleU[i])
+        partPrimaryScaleV.push(partHit.primaryScaleV[i])
         partSecondaryTexturePaths.push(partHit.secondaryTexturePaths[i])
         partSecondaryTextureAddressU.push(partHit.secondaryTextureAddressU[i])
         partSecondaryTextureAddressV.push(partHit.secondaryTextureAddressV[i])
         partSecondaryUvSetIndices.push(partHit.secondaryUvSetIndices[i] ?? 0)
         partChunkTrace.push(partHit.chunkTrace[i])
         partShaderPaths.push(partHit.shaderPaths[i])
+        partEffectPaths.push(partHit.effectPaths[i])
       }
       continue
     }
@@ -4337,12 +5178,15 @@ async function resolveKnownPalaceComposite(
     partNormalTextureAddressU.push(partTextureHit?.normalTextureAddressU)
     partNormalTextureAddressV.push(partTextureHit?.normalTextureAddressV)
     partPrimaryUvSetIndices.push(0)
+    partPrimaryScaleU.push(undefined)
+    partPrimaryScaleV.push(undefined)
     partSecondaryTexturePaths.push(undefined)
     partSecondaryTextureAddressU.push(undefined)
     partSecondaryTextureAddressV.push(undefined)
     partSecondaryUvSetIndices.push(0)
     partChunkTrace.push(undefined)
     partShaderPaths.push(partTextureHit?.shaderPath)
+    partEffectPaths.push(undefined)
   }
 
   const merged = combineMeshes(parts)
@@ -4363,19 +5207,28 @@ async function resolveKnownPalaceComposite(
     meshPartNormalTextureAddressU: partNormalTextureAddressU,
     meshPartNormalTextureAddressV: partNormalTextureAddressV,
     meshPartPrimaryUvSetIndices: partPrimaryUvSetIndices,
+    meshPartPrimaryScaleU: partPrimaryScaleU,
+    meshPartPrimaryScaleV: partPrimaryScaleV,
     meshPartSecondaryTexturePaths: partSecondaryTexturePaths,
     meshPartSecondaryTextureAddressU: partSecondaryTextureAddressU,
     meshPartSecondaryTextureAddressV: partSecondaryTextureAddressV,
     meshPartSecondaryUvSetIndices: partSecondaryUvSetIndices,
     meshPartChunkTrace: partChunkTrace,
     meshPartShaderPaths: partShaderPaths,
+    meshPartEffectPaths: partEffectPaths,
   }
 }
+
+// Retired heuristic helpers kept for reference while deterministic path is active.
+void buildLikelyComponentCmpCandidates
+void resolveSieCompositeMesh
+void resolveKnownPalaceComposite
 
 async function resolveBestDecodedMesh(
   refs: string[],
   lookup: RepositoryLookup,
   allowCmpComposite = true,
+  deterministicOrder = false,
 ): Promise<DecodedMeshHit | null> {
   const candidates = Array.from(new Set(refs.map((value) => normalizeSwgPath(value))))
     .filter((value) => ext(value) === '.msh' || ext(value) === '.lod' || ext(value) === '.pob' || ext(value) === '.cmp')
@@ -4384,12 +5237,14 @@ async function resolveBestDecodedMesh(
 
   let best: DecodedMeshHit | null = null
   let bestScore = Number.NEGATIVE_INFINITY
-  const consider = (hit: DecodedMeshHit) => {
+  const consider = (hit: DecodedMeshHit): DecodedMeshHit | null => {
+    if (deterministicOrder) return hit
     const score = meshQualityScore(hit.mesh) + meshPathDetailBias(hit.path)
     if (!best || score > bestScore) {
       best = hit
       bestScore = score
     }
+    return null
   }
 
   for (const candidate of candidates) {
@@ -4401,18 +5256,30 @@ async function resolveBestDecodedMesh(
 
     if (candidateExt === '.cmp' && allowCmpComposite) {
       const cmpComposite = await resolveCmpCompositeMesh(candidate, lookup)
-      if (cmpComposite?.mesh) consider(cmpComposite)
+      if (cmpComposite?.mesh) {
+        const chosen = consider(cmpComposite)
+        if (chosen) return chosen
+      }
       continue
     }
 
     if (candidateExt === '.lod') {
-      const lodRefs = Array.from(
+      // Parse LOD file to extract actual mesh references
+      const lodRefs = extractLodMeshRefs(buffer, candidate)
+      // Deterministic: include all explicit refs discoverable from the LOD file payload.
+      const genericRefs = Array.from(
         new Set(getResolvedRefCandidatesCached(candidate, buffer)),
       ).filter((value) => ext(value) === '.msh')
+      for (const ref of genericRefs) {
+        if (!lodRefs.includes(ref)) lodRefs.push(ref)
+      }
 
-      const synthesizedRefs = buildLodSiblingMeshCandidates(candidate)
-      for (const sibling of synthesizedRefs) {
-        if (!lodRefs.includes(sibling)) lodRefs.push(sibling)
+      if (!deterministicOrder) {
+        // Fallback to filename-based guessing
+        const synthesizedRefs = buildLodSiblingMeshCandidates(candidate)
+        for (const sibling of synthesizedRefs) {
+          if (!lodRefs.includes(sibling)) lodRefs.push(sibling)
+        }
       }
 
       const lodPartMeshes: PreviewMeshData[] = []
@@ -4426,33 +5293,40 @@ async function resolveBestDecodedMesh(
         const normalizedLodMesh = normalizeCandidateMesh(lodMesh)
         if (!normalizedLodMesh) continue
         lodPartMeshes.push(normalizedLodMesh)
-        consider({
+        const chosen = consider({
           path: lodRef,
           sourceLabel: lodSource.sourceLabel,
           mesh: normalizedLodMesh,
         })
+        if (chosen) return chosen
       }
 
       const combinedLodMesh = combineMeshes(lodPartMeshes)
       const normalizedCombinedLodMesh = combinedLodMesh ? normalizeCandidateMesh(combinedLodMesh) : null
       if (normalizedCombinedLodMesh) {
         // Also consider a merged LOD candidate to preserve multi-part structures.
-        consider({
+        const chosen = consider({
           path: candidate,
           sourceLabel: source.sourceLabel,
           mesh: normalizedCombinedLodMesh,
         })
+        if (chosen) return chosen
       }
+
+      // Deterministic mode: never decode raw .lod payload as geometry.
+      // LOD must resolve through explicit mesh references only.
+      continue
     }
 
     const decoded = extractMeshFromAsset(buffer, candidate)
     const normalizedDecoded = decoded ? normalizeCandidateMesh(decoded) : null
     if (normalizedDecoded) {
-      consider({
+      const chosen = consider({
         path: candidate,
         sourceLabel: source.sourceLabel,
         mesh: normalizedDecoded,
       })
+      if (chosen) return chosen
     }
   }
 
@@ -4532,16 +5406,19 @@ export async function resolveTemplateVisual(
 
   const appearanceBuffer = await appearanceSource.file.arrayBuffer()
   const appearanceRefs = getResolvedRefCandidatesCached(appearancePath, appearanceBuffer)
-
-  if (ext(appearancePath) === '.pob') {
-    // POB is a frequent root for large building appearances and directly references LOD/MSH assets.
-    appearanceRefs.unshift(appearancePath)
-  }
+  const pobCellEntries = ext(appearancePath) === '.pob'
+    ? extractPobCellAppearanceRefs(appearanceBuffer, appearancePath)
+    : []
 
   const shaderHit = await resolveFirstExistingByExt(appearanceRefs, ['.sht', '.sat', '.trt'], lookup)
   let shaderPath = shaderHit?.path
 
   let meshCandidates = [...appearanceRefs]
+  if (ext(appearancePath) === '.pob') {
+    // Deterministic ordering: prefer explicitly referenced exterior LOD/MSH first.
+    // Keep the top-level POB decode as fallback, not first choice.
+    meshCandidates.push(appearancePath)
+  }
   let detailPreferredRef: string | null = null
   if (ext(appearancePath) === '.apt') {
     detailPreferredRef = extractDtlLastChildRef(appearanceBuffer, appearancePath)
@@ -4554,10 +5431,6 @@ export async function resolveTemplateVisual(
   }
 
   const cmpRefs = meshCandidates.filter((p) => ext(p) === '.cmp')
-  const likelyCmpRefs = buildLikelyComponentCmpCandidates(appearancePath)
-  for (const cmpRef of likelyCmpRefs) {
-    if (!cmpRefs.includes(cmpRef)) cmpRefs.push(cmpRef)
-  }
 
   for (const cmp of cmpRefs) {
     const cmpMeshes = await collectCmpMeshRefs(cmp, lookup)
@@ -4565,22 +5438,179 @@ export async function resolveTemplateVisual(
   }
 
   meshCandidates = Array.from(new Set(meshCandidates))
-  const meshHintHit = await resolveFirstExistingByExt(meshCandidates, ['.msh', '.lod', '.pob'], lookup)
-  const preferDecodedOverComposite = options.preferDecodedOverComposite === true
-  let decodedMeshHit: DecodedMeshHit | null
-  if (preferDecodedOverComposite) {
-    const decodedPrimaryHit = await resolveBestDecodedMesh(meshCandidates, lookup)
-    const knownCompositeHit = decodedPrimaryHit ? null : await resolveKnownPalaceComposite(appearancePath, lookup)
-    const sieCompositeHit = decodedPrimaryHit || knownCompositeHit
-      ? null
-      : await resolveSieCompositeMesh([appearancePath, ...meshCandidates], lookup)
-    decodedMeshHit = decodedPrimaryHit ?? knownCompositeHit ?? sieCompositeHit
-  } else {
-    const knownCompositeHit = await resolveKnownPalaceComposite(appearancePath, lookup)
-    const sieCompositeHit = knownCompositeHit ?? (await resolveSieCompositeMesh([appearancePath, ...meshCandidates], lookup))
-    decodedMeshHit = sieCompositeHit ?? (await resolveBestDecodedMesh(meshCandidates, lookup))
+  const effectiveExteriorCandidatesUnordered = meshCandidates
+
+  const extPriority = (value: string): number => {
+    const valueExt = ext(value)
+    if (valueExt === '.msh') return 0
+    if (valueExt === '.lod') return 1
+    if (valueExt === '.cmp') return 2
+    if (valueExt === '.apt') return 3
+    if (valueExt === '.pob') return 4
+    return 5
   }
+  const effectiveExteriorCandidates = [...effectiveExteriorCandidatesUnordered]
+    .sort((a, b) => {
+      const byType = extPriority(a) - extPriority(b)
+      if (byType !== 0) return byType
+      return a.localeCompare(b)
+    })
+
+  const declaredExteriorMeshRefs = await collectDeclaredMeshRefs(effectiveExteriorCandidates, lookup)
+  const deterministicExteriorCandidates = declaredExteriorMeshRefs.length > 0
+    ? declaredExteriorMeshRefs
+    : effectiveExteriorCandidates
+
+  console.log('[Resolver Exterior] Candidate trace', {
+    template: normalizedTemplate,
+    appearance: appearancePath,
+    effectiveExteriorCandidates,
+    declaredExteriorMeshRefs,
+    deterministicExteriorCandidates,
+  })
+
+  const meshHintHit = await resolveFirstExistingByExt(deterministicExteriorCandidates, ['.msh', '.lod', '.pob'], lookup)
+  const isPrimaryExteriorDecodeCandidate = (value: string): boolean => {
+    const valueExt = ext(value)
+    return valueExt === '.msh' || valueExt === '.lod' || valueExt === '.cmp' || valueExt === '.apt'
+  }
+  const exteriorDecodePrimary = deterministicExteriorCandidates.filter(isPrimaryExteriorDecodeCandidate)
+  const exteriorEntriesPrimary: PobCellAppearanceEntry[] = exteriorDecodePrimary.map((ref) => ({ ref }))
+  const mergedExteriorPrimaryHit = await resolveMergedDecodedMeshes(exteriorEntriesPrimary, lookup)
+  const bestDecodedExteriorPrimaryHit = exteriorDecodePrimary.length > 0
+    ? await resolveBestDecodedMesh(exteriorDecodePrimary, lookup, true, true)
+    : null
+  const sieCompositePrimaryHit = exteriorDecodePrimary.length > 0
+    ? await resolveSieCompositeMesh(exteriorDecodePrimary, lookup)
+    : null
+
+  const secondaryCandidateSet = Array.from(new Set(effectiveExteriorCandidates.filter(isPrimaryExteriorDecodeCandidate)))
+  const hasDifferentSecondarySet = secondaryCandidateSet.length !== exteriorDecodePrimary.length
+    || secondaryCandidateSet.some((value, index) => value !== exteriorDecodePrimary[index])
+  const exteriorEntriesSecondary: PobCellAppearanceEntry[] = hasDifferentSecondarySet
+    ? secondaryCandidateSet.map((ref) => ({ ref }))
+    : []
+  const mergedExteriorSecondaryHit = exteriorEntriesSecondary.length > 0
+    ? await resolveMergedDecodedMeshes(exteriorEntriesSecondary, lookup)
+    : null
+  const bestDecodedExteriorSecondaryHit = exteriorEntriesSecondary.length > 0
+    ? await resolveBestDecodedMesh(secondaryCandidateSet, lookup, true, true)
+    : null
+  const sieCompositeSecondaryHit = exteriorEntriesSecondary.length > 0
+    ? await resolveSieCompositeMesh(secondaryCandidateSet, lookup)
+    : null
+  const knownPalaceExteriorHit = await resolveKnownPalaceComposite(appearancePath, lookup)
+  const extentOfHit = (hit: DecodedMeshHit | null): number | null => {
+    if (!hit?.mesh) return null
+    const bounds = getMeshBounds(hit.mesh)
+    if (!bounds) return null
+    const extent = Math.max(bounds.sizeX, bounds.sizeY, bounds.sizeZ)
+    if (!Number.isFinite(extent) || extent <= 0) return null
+    return extent
+  }
+
+  const rawExteriorCandidates = [
+    { tag: 'knownPalace', hit: knownPalaceExteriorHit },
+    { tag: 'siePrimary', hit: sieCompositePrimaryHit },
+    { tag: 'mergedPrimary', hit: mergedExteriorPrimaryHit },
+    { tag: 'bestPrimary', hit: bestDecodedExteriorPrimaryHit },
+    { tag: 'sieSecondary', hit: sieCompositeSecondaryHit },
+    { tag: 'mergedSecondary', hit: mergedExteriorSecondaryHit },
+    { tag: 'bestSecondary', hit: bestDecodedExteriorSecondaryHit },
+  ]
+
+  const extentSamples = rawExteriorCandidates
+    .map((entry) => extentOfHit(entry.hit))
+    .filter((value): value is number => value !== null)
+    .sort((a, b) => a - b)
+  const referenceExtent = extentSamples.length > 0
+    ? extentSamples[Math.floor(extentSamples.length / 2)]
+    : null
+
+  const exteriorHitScore = (hit: DecodedMeshHit | null): number => {
+    if (!hit?.mesh) return Number.NEGATIVE_INFINITY
+    const extent = extentOfHit(hit)
+    if (extent === null) return Number.NEGATIVE_INFINITY
+
+    if (referenceExtent !== null) {
+      // Reject pathological exploded/collapsed geometry relative to peer candidates.
+      if (extent > referenceExtent * 6 || extent < referenceExtent / 6) {
+        return Number.NEGATIVE_INFINITY
+      }
+    }
+
+    // Absolute safety gate for known bad decodes that explode to extreme bounds.
+    if (extent > 5000) return Number.NEGATIVE_INFINITY
+
+    const partCount = hit.meshParts?.length ?? 1
+    const texturedPartCount = (hit.meshPartTexturePaths ?? []).filter((value) => Boolean(value && value.trim().length > 0)).length
+    return partCount * 1_000_000_000 + texturedPartCount * 1_000_000 + meshQualityScore(hit.mesh)
+  }
+
+  const rankedExteriorHits = rawExteriorCandidates
+    .map((entry) => ({
+      ...entry,
+      extent: extentOfHit(entry.hit),
+      score: exteriorHitScore(entry.hit),
+    }))
+    .sort((a, b) => b.score - a.score)
+
+  const isRenderableExterior = (entry: { score: number }) =>
+    Number.isFinite(entry.score) && entry.score > Number.NEGATIVE_INFINITY
+
+  const isPalaceFamily =
+    normalizedTemplate.includes('palace_naboo_theed') ||
+    appearancePath.includes('thm_nboo_thed_theed_palace') ||
+    appearancePath.includes('shared_base_palace')
+
+  const palacePrecedence = [
+    'knownPalace',
+    'siePrimary',
+    'mergedPrimary',
+    'bestPrimary',
+    'sieSecondary',
+    'mergedSecondary',
+    'bestSecondary',
+  ] as const
+
+  const chosenExterior = isPalaceFamily
+    ? palacePrecedence
+        .map((tag) => rankedExteriorHits.find((entry) => entry.tag === tag))
+        .find((entry): entry is NonNullable<typeof entry> => Boolean(entry && isRenderableExterior(entry)))
+      ?? rankedExteriorHits.find((entry) => isRenderableExterior(entry))
+    : rankedExteriorHits.find((entry) => isRenderableExterior(entry))
+
+  const decodedMeshHit = chosenExterior?.hit ?? null
   const meshPath = decodedMeshHit?.path ?? meshHintHit?.path
+
+  console.log('[Resolver Exterior] Merge result', {
+    template: normalizedTemplate,
+    meshHintPath: meshHintHit?.path,
+    exteriorDecodePrimary,
+    secondaryCandidateSet,
+    mergedPrimaryPath: mergedExteriorPrimaryHit?.path,
+    mergedPrimaryPartCount: mergedExteriorPrimaryHit?.meshParts?.length ?? 0,
+    bestPrimaryPath: bestDecodedExteriorPrimaryHit?.path,
+    bestPrimaryPartCount: bestDecodedExteriorPrimaryHit?.meshParts?.length ?? (bestDecodedExteriorPrimaryHit?.mesh ? 1 : 0),
+    siePrimaryPath: sieCompositePrimaryHit?.path,
+    siePrimaryPartCount: sieCompositePrimaryHit?.meshParts?.length ?? (sieCompositePrimaryHit?.mesh ? 1 : 0),
+    mergedSecondaryPath: mergedExteriorSecondaryHit?.path,
+    mergedSecondaryPartCount: mergedExteriorSecondaryHit?.meshParts?.length ?? 0,
+    bestSecondaryPath: bestDecodedExteriorSecondaryHit?.path,
+    bestSecondaryPartCount: bestDecodedExteriorSecondaryHit?.meshParts?.length ?? (bestDecodedExteriorSecondaryHit?.mesh ? 1 : 0),
+    sieSecondaryPath: sieCompositeSecondaryHit?.path,
+    sieSecondaryPartCount: sieCompositeSecondaryHit?.meshParts?.length ?? (sieCompositeSecondaryHit?.mesh ? 1 : 0),
+    knownPalacePath: knownPalaceExteriorHit?.path,
+    knownPalacePartCount: knownPalaceExteriorHit?.meshParts?.length ?? (knownPalaceExteriorHit?.mesh ? 1 : 0),
+    isPalaceFamily,
+    palacePrecedence,
+    referenceExtent,
+    chosenExteriorTag: chosenExterior?.tag,
+    rankedExteriorHits: rankedExteriorHits.map((entry) => ({ tag: entry.tag, score: entry.score, extent: entry.extent, path: entry.hit?.path })),
+    decodedPath: decodedMeshHit?.path,
+    decodedPartCount: decodedMeshHit?.meshParts?.length ?? (decodedMeshHit?.mesh ? 1 : 0),
+    finalMeshPath: meshPath,
+  })
 
   let texturePath: string | undefined
   let textureAddressU: TextureAddressMode | undefined
@@ -4632,45 +5662,15 @@ export async function resolveTemplateVisual(
     }
   }
 
-  if (!texturePath) {
-    const meshChainRoots = [appearancePath, ...meshCandidates]
-      .map((value) => normalizeSwgPath(value))
-      .filter((value) => ['.pob', '.apt', '.lod', '.cmp', '.msh'].includes(ext(value)))
-    const meshRefsForTexture = await collectSieChainMeshRefs(meshChainRoots, lookup)
-    const meshTextureHit = await resolveTextureFromMeshShaderChain(meshRefsForTexture, lookup, options)
-    if (meshTextureHit) {
-      if (!shaderPath && meshTextureHit.shaderPath) shaderPath = meshTextureHit.shaderPath
-      texturePath = meshTextureHit.texturePath
-      textureAddressU = meshTextureHit.textureAddressU
-      textureAddressV = meshTextureHit.textureAddressV
-      textureMipmapFilter = meshTextureHit.textureMipmapFilter
-      textureMinificationFilter = meshTextureHit.textureMinificationFilter
-      textureMagnificationFilter = meshTextureHit.textureMagnificationFilter
-      normalTexturePath = meshTextureHit.normalTexturePath
-      normalTextureAddressU = meshTextureHit.normalTextureAddressU
-      normalTextureAddressV = meshTextureHit.normalTextureAddressV
-      textureSourceLabel = meshTextureHit.textureSourceLabel
-      normalTextureSourceLabel = meshTextureHit.normalTextureSourceLabel
-    }
-  }
-
-  if (!texturePath && !options.strictDeclaredOnly) {
-    const textureHit = await resolveFirstExistingByExt(appearanceRefs, ['.dds', '.tga'], lookup)
-    if (textureHit) {
-      texturePath = textureHit.path
-      textureSourceLabel = textureHit.source.sourceLabel
-    }
-  }
+  // No fallback texture guessing in deterministic mode.
 
   let pobMeshFallback: PreviewMeshData | undefined
   let pobInteriorHit: DecodedMeshHit | null = null
   if (ext(appearancePath) === '.pob') {
     // Keep embedded POB geometry as a fallback, but still prefer external LOD/MSH meshes.
     pobMeshFallback = extractMeshFromAsset(appearanceBuffer, appearancePath) ?? undefined
-    const pobCellRefs = extractPobCellAppearanceRefs(appearanceBuffer, appearancePath)
-      .filter((value) => value.ref !== appearancePath)
-    if (pobCellRefs.length > 0) {
-      pobInteriorHit = await resolveMergedDecodedMeshes(pobCellRefs, lookup)
+    if (pobCellEntries.length > 0) {
+      pobInteriorHit = await resolveMergedDecodedMeshes(pobCellEntries, lookup)
     }
   }
 
@@ -4749,6 +5749,7 @@ export async function resolveTemplateVisual(
   const renderMeshPartSecondaryUvSetIndices: number[] = []
   const renderMeshPartChunkTrace: (string | undefined)[] = []
   const renderMeshPartShaderPaths: (string | undefined)[] = []
+  const renderMeshPartEffectPaths: (string | undefined)[] = []
   const renderMeshPartDomains: Array<'exterior' | 'interior'> = []
   const seenRenderPartKeys = new Set<string>()
 
@@ -4804,6 +5805,7 @@ export async function resolveTemplateVisual(
     secondaryUvSetIndices: number[] = [],
     shaderPaths: (string | undefined)[] = [],
     chunkTrace: (string | undefined)[] = [],
+    effectPaths: (string | undefined)[] = [],
     domain: 'exterior' | 'interior' = 'exterior',
   ) => {
     for (let i = 0; i < parts.length; i++) {
@@ -4822,9 +5824,10 @@ export async function resolveTemplateVisual(
       const hasAnyUv = hasUv0 || hasUv1 || hasUvSet
 
       // Collision/aux parts often appear in decoded meshes with no shader binding and no UVs.
-      // They produce stretched artifacts in preview and should not enter visual render output.
+      // Apply this cull only to interior assembly; exterior shells may include valid geometry
+      // chunks without explicit per-part bindings.
       const hasBinding = Boolean(baseTexture || normalTexture || secondaryTexture || (trace && trace !== 'n/a'))
-      if (!hasBinding && !hasAnyUv) continue
+      if (domain === 'interior' && !hasBinding && !hasAnyUv) continue
 
       const primaryUv = primaryUvSetIndices[i] ?? 0
       const partKey = buildRenderPartKey(part, baseTexture, primaryUv)
@@ -4847,6 +5850,7 @@ export async function resolveTemplateVisual(
       renderMeshPartSecondaryTextureAddressV.push(secondaryTextureAddressV[i])
       renderMeshPartSecondaryUvSetIndices.push(secondaryUvSetIndices[i] ?? 0)
       renderMeshPartShaderPaths.push(shaderPaths[i])
+      renderMeshPartEffectPaths.push(effectPaths[i])
       renderMeshPartChunkTrace.push(chunkTrace[i])
       renderMeshPartDomains.push(domain)
     }
@@ -4878,6 +5882,7 @@ export async function resolveTemplateVisual(
       decodedMeshHit.meshPartSecondaryUvSetIndices,
       decodedMeshHit.meshPartShaderPaths,
       decodedMeshHit.meshPartChunkTrace,
+      decodedMeshHit.meshPartEffectPaths,
       'exterior',
     )
   }
@@ -4902,6 +5907,7 @@ export async function resolveTemplateVisual(
     let interiorSecondaryUvs: number[] = pobInteriorHit.meshPartSecondaryUvSetIndices || []
     let interiorShaderPaths: (string | undefined)[] = pobInteriorHit.meshPartShaderPaths || []
     let interiorChunkTrace: (string | undefined)[] = pobInteriorHit.meshPartChunkTrace || []
+    let interiorEffectPaths: (string | undefined)[] = pobInteriorHit.meshPartEffectPaths || []
 
     const isLikelyExteriorTagged = (value: string): boolean => {
       const lower = value.toLowerCase()
@@ -4952,6 +5958,7 @@ export async function resolveTemplateVisual(
     interiorSecondaryUvs = keptIndices.map((index) => pickOr(interiorSecondaryUvs, index, 0))
     interiorShaderPaths = keptIndices.map((index) => pickOr(interiorShaderPaths, index, undefined))
     interiorChunkTrace = keptIndices.map((index) => pickOr(interiorChunkTrace, index, undefined))
+    interiorEffectPaths = keptIndices.map((index) => pickOr(interiorEffectPaths, index, undefined))
 
     interiorPrimaryUvs = interiorParts.map((part, i) =>
       chooseInteriorPrimaryUvSet(part, interiorPrimaryUvs[i] ?? 0)
@@ -5009,11 +6016,14 @@ export async function resolveTemplateVisual(
       interiorSecondaryUvs,
       interiorShaderPaths,
       interiorChunkTrace,
+      interiorEffectPaths,
       'interior',
     )
   }
 
-  if (pobMeshFallback && !decodedMeshHit?.mesh && !pobInteriorHit?.mesh) {
+  // Deterministic fallback: if no authoritative/decoded exterior was resolved,
+  // keep the declared appearance POB mesh as exterior even when interior cells exist.
+  if (pobMeshFallback && !decodedMeshHit?.mesh) {
     finalMeshParts.push(pobMeshFallback)
     finalPathParts.push(appearancePath)
     finalSourceParts.push(appearanceSource.sourceLabel)
@@ -5028,6 +6038,20 @@ export async function resolveTemplateVisual(
     ? `combined:${appearancePath}`
     : finalPathParts[0] ?? meshPath
   const resolvedSourceLabel = Array.from(new Set(finalSourceParts.filter(Boolean))).join('+') || appearanceSource.sourceLabel
+
+  // Log final texture resolution for debugging
+  console.log(`[Texture Resolution] Template: ${normalizedTemplate}`)
+  console.log(`[Texture Resolution]   Appearance: ${appearancePath}`)
+  console.log(`[Texture Resolution]   Shader: ${shaderPath || 'none'}`)
+  console.log(`[Texture Resolution]   Mesh: ${resolvedMeshPath || 'none'}`)
+  console.log(`[Texture Resolution]   \u2713 MAIN TEXTURE: ${texturePath || 'none'}`)
+  if (normalTexturePath) console.log(`[Texture Resolution]   \u2713 NORMAL: ${normalTexturePath}`)
+  if (renderMeshPartTexturePaths.length > 0) {
+    console.log(`[Texture Resolution]   Mesh parts (${renderMeshPartTexturePaths.length}):`)
+    renderMeshPartTexturePaths.forEach((path, i) => {
+      console.log(`[Texture Resolution]     Part ${i}: ${path || 'none'}`)
+    })
+  }
 
   return {
     templatePath: normalizedTemplate,
@@ -5099,6 +6123,9 @@ export async function resolveTemplateVisual(
       : undefined,
     meshPartShaderPaths: renderMeshPartShaderPaths.length
       ? renderMeshPartShaderPaths
+      : undefined,
+    meshPartEffectPaths: renderMeshPartEffectPaths.length
+      ? renderMeshPartEffectPaths
       : undefined,
     meshPartDomains: renderMeshPartDomains.length
       ? renderMeshPartDomains

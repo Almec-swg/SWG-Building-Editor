@@ -7,12 +7,14 @@ import { extractBuildingObjectsFromIff, parseIff } from './iffParser'
 import { buildFileTree } from './fileTree'
 import type { FileTreeNode } from './fileTree'
 import {
-  clearPreviewResolverCaches,
   normalizeSwgPath,
   resolveTemplateVisual,
   type RepositorySourceFile,
   type ResolvedTemplateVisual,
   extractMeshFromAsset,
+  getShaderDebugChunks,
+  getEffectDebugChunks,
+  getShaderRenderProps,
 } from './previewResolver'
 import { extractTreRecord, parseTreArchive, type TreCompression, type TreRecordMeta } from './treParser'
 import './App.css'
@@ -85,6 +87,8 @@ type ResolvedVisualMap = Record<string, ResolvedTemplateVisual | undefined>
 type ResolvedTextureMap = Record<string, {
   url: string
   texturePath: string
+  alternateUrl?: string
+  alternateTexturePath?: string
   textureAddressU?: 'wrap' | 'mirror' | 'clamp' | 'border' | 'mirroronce'
   textureAddressV?: 'wrap' | 'mirror' | 'clamp' | 'border' | 'mirroronce'
   textureMipmapFilter?: 'none' | 'point' | 'linear' | 'anisotropic' | 'flatcubic' | 'gaussiancubic'
@@ -128,6 +132,8 @@ interface SurfacePickMetadata {
   detailAddressU?: string
   detailAddressV?: string
   chunkTrace?: string
+  shaderDebugChunks?: string[]  // Shader IFF structure for debugging
+  effectDebugChunks?: string[]   // Effect (.eft) IFF structure for debugging
   uvCalibrationTransform?: string
   uvCalibrationScaleU?: number
   uvCalibrationScaleV?: number
@@ -376,6 +382,9 @@ const PreviewCanvas = memo(function PreviewCanvas({
     material: THREE.MeshPhongMaterial,
     context: 'object' | 'root',
   ) => void>(() => {})
+  const applyStoredShaderMaterialStateRef = useRef<(
+    material: THREE.MeshPhongMaterial,
+  ) => void>(() => {})
   const allMaterialsRef = useRef<Array<{
     material: THREE.MeshPhongMaterial
     templatePath: string | undefined
@@ -511,6 +520,9 @@ const PreviewCanvas = memo(function PreviewCanvas({
       `resolvedTexturePath: ${textureMeta?.texturePath ?? materialColorPath ?? 'n/a'}`,
       `resolvedNormalPath: ${textureMeta?.normalTexturePath ?? materialNormalPath ?? 'n/a'}`,
       `resolvedSecondaryPath: ${textureMeta?.secondaryTexturePath ?? 'n/a'}`,
+      `material.transparent: ${phongMaterial?.transparent ?? 'n/a'}`,
+      `material.opacity: ${phongMaterial ? phongMaterial.opacity.toFixed(6) : 'n/a'}`,
+      `material.alphaTest: ${phongMaterial ? phongMaterial.alphaTest.toFixed(6) : 'n/a'}`,
       `faceIndex: ${hit.faceIndex ?? 'n/a'}`,
       `distance: ${Number.isFinite(hit.distance) ? hit.distance.toFixed(6) : 'n/a'}`,
       `hitPoint: [${point.x.toFixed(6)}, ${point.y.toFixed(6)}, ${point.z.toFixed(6)}]`,
@@ -520,9 +532,116 @@ const PreviewCanvas = memo(function PreviewCanvas({
       `uv2Count: ${uv2Attr?.count ?? 0}`,
       `uvRange: ${computeUvStats(uvAttr)}`,
       `uv2Range: ${computeUvStats(uv2Attr)}`,
+      (() => {
+        if (!positionAttr) return `meshBounds: n/a`
+        let minX = Infinity, minY = Infinity, minZ = Infinity
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+        for (let i = 0; i < positionAttr.count; i++) {
+          const x = positionAttr.getX(i), y = positionAttr.getY(i), z = positionAttr.getZ(i)
+          if (x < minX) minX = x; if (x > maxX) maxX = x
+          if (y < minY) minY = y; if (y > maxY) maxY = y
+          if (z < minZ) minZ = z; if (z > maxZ) maxZ = z
+        }
+        const dx = (maxX - minX).toFixed(3), dy = (maxY - minY).toFixed(3), dz = (maxZ - minZ).toFixed(3)
+        return `meshBounds: [${minX.toFixed(3)},${minY.toFixed(3)},${minZ.toFixed(3)}] -> [${maxX.toFixed(3)},${maxY.toFixed(3)},${maxZ.toFixed(3)}] (dX=${dx} dY=${dy} dZ=${dz})`
+      })(),
+      (() => {
+        // Show UV + XYZ for the 3 vertices of the hit triangle
+        const fi = hit.faceIndex
+        if (fi == null || !uvAttr || !positionAttr) return 'hitFace: n/a'
+        const idx = geometry?.index
+        let a: number, b: number, c: number
+        if (idx) {
+          a = idx.getX(fi * 3); b = idx.getX(fi * 3 + 1); c = idx.getX(fi * 3 + 2)
+        } else {
+          a = fi * 3; b = fi * 3 + 1; c = fi * 3 + 2
+        }
+        const fmtV = (i: number) => {
+          const u = uvAttr.getX(i).toFixed(4), v = uvAttr.getY(i).toFixed(4)
+          const x = positionAttr.getX(i).toFixed(2), y = positionAttr.getY(i).toFixed(2), z = positionAttr.getZ(i).toFixed(2)
+          return `v${i}(uv=${u},${v} xyz=${x},${y},${z})`
+        }
+        const fa = fmtV(a), fb = fmtV(b), fc = fmtV(c)
+        const du = Math.max(uvAttr.getX(a), uvAttr.getX(b), uvAttr.getX(c)) - Math.min(uvAttr.getX(a), uvAttr.getX(b), uvAttr.getX(c))
+        const dv = Math.max(uvAttr.getY(a), uvAttr.getY(b), uvAttr.getY(c)) - Math.min(uvAttr.getY(a), uvAttr.getY(b), uvAttr.getY(c))
+        return `hitFace[${fi}]: ${fa} | ${fb} | ${fc} | faceUvSpan=(dU=${du.toFixed(4)} dV=${dv.toFixed(4)})`
+      })(),
       `uvCalibrationTransform: ${meta.uvCalibrationTransform ?? 'n/a'}`,
       `uvCalibrationScale: [${meta.uvCalibrationScaleU?.toFixed(6) ?? 'n/a'}, ${meta.uvCalibrationScaleV?.toFixed(6) ?? 'n/a'}]`,
       `uvCalibrationTargetSource: ${meta.uvCalibrationTargetSource ?? 'n/a'}`,
+      (() => {
+        // Dump every vertex (position + every available UV channel) and every triangle's indices
+        // so we can see whether our decoded UVs match what the mesh actually authored.
+        if (!positionAttr) return '\n--- Full Mesh Part Dump ---\nno position attribute'
+        const lines: string[] = ['', '--- Full Mesh Part Dump ---']
+        const channelNames = ['uv', 'uv1', 'uv2', 'uv3', 'uv4', 'uv5', 'uv6', 'uv7']
+        const channels: Array<{ name: string; attr: THREE.BufferAttribute }> = []
+        for (const name of channelNames) {
+          const a = geometry?.getAttribute(name) as THREE.BufferAttribute | undefined
+          if (a && a.itemSize >= 2 && a.count > 0) channels.push({ name, attr: a })
+        }
+        lines.push(`channels: position(itemSize=${positionAttr.itemSize}, count=${positionAttr.count}) ${channels.map((c) => `${c.name}(itemSize=${c.attr.itemSize}, count=${c.attr.count})`).join(' | ')}`)
+        const vertCount = positionAttr.count
+        for (let i = 0; i < vertCount; i++) {
+          const x = positionAttr.getX(i).toFixed(3)
+          const y = positionAttr.getY(i).toFixed(3)
+          const z = positionAttr.getZ(i).toFixed(3)
+          const uvs = channels.map((c) => `${c.name}=(${c.attr.getX(i).toFixed(4)},${c.attr.getY(i).toFixed(4)})`).join(' ')
+          lines.push(`  vtx[${i}] pos=(${x},${y},${z}) ${uvs}`)
+        }
+        const idx = geometry?.index
+        if (idx) {
+          const triCount2 = Math.floor(idx.count / 3)
+          for (let t = 0; t < triCount2; t++) {
+            lines.push(`  tri[${t}] = (${idx.getX(t * 3)}, ${idx.getX(t * 3 + 1)}, ${idx.getX(t * 3 + 2)})`)
+          }
+        } else {
+          lines.push('  (no index buffer)')
+        }
+        const dd = (geometry?.userData as any)?.decodeDebug
+        if (typeof dd === 'string' && dd.length > 0) {
+          lines.push('')
+          lines.push('--- MSH Decoder Debug ---')
+          lines.push(dd)
+        }
+        return lines.join('\n')
+      })(),
+      '',
+      '--- UV Application Debug ---',
+      `uvDebug.called: ${(geometry?.userData?.uvDebug as any)?.called ?? false}`,
+      `uvDebug.hasPosition: ${(geometry?.userData?.uvDebug as any)?.hasPosition ?? 'n/a'}`,
+      `uvDebug.positionCount: ${(geometry?.userData?.uvDebug as any)?.positionCount ?? 'n/a'}`,
+      `uvDebug.hasUvs: ${(geometry?.userData?.uvDebug as any)?.hasUvs ?? 'n/a'}`,
+      `uvDebug.uvsLength: ${(geometry?.userData?.uvDebug as any)?.uvsLength ?? 'n/a'}`,
+      `uvDebug.requiredUvLength: ${(geometry?.userData?.uvDebug as any)?.requiredUvLength ?? 'n/a'}`,
+      `uvDebug.hasUvChannel: ${(geometry?.userData?.uvDebug as any)?.hasUvChannel ?? 'n/a'}`,
+      `uvDebug.earlyReturn: ${(geometry?.userData?.uvDebug as any)?.earlyReturn ?? 'n/a'}`,
+      `uvDebug.earlyReturnReason: ${(geometry?.userData?.uvDebug as any)?.earlyReturnReason ?? 'n/a'}`,
+      `uvDebug.shaderPath: ${(geometry?.userData?.uvDebug as any)?.shaderPath ?? 'n/a'}`,
+      `uvDebug.debugKey: ${(geometry?.userData?.uvDebug as any)?.debugKey ?? 'n/a'}`,
+      '',
+      ...(((geometry?.userData as any)?.shaderDebugChunks) 
+        ? [
+            '--- Shader IFF Structure ---',
+            ...((geometry?.userData as any)?.shaderDebugChunks as string[]),
+            '',
+          ]
+        : meta.shaderDebugChunks && meta.shaderDebugChunks.length > 0
+          ? [
+              '--- Shader IFF Structure ---',
+              ...meta.shaderDebugChunks,
+              '',
+            ]
+          : []),
+      ...((() => {
+        const effectChunks = meta.effectPath ? getEffectDebugChunks(meta.effectPath) : undefined
+        if (!effectChunks || effectChunks.length === 0) return []
+        return [
+          `--- Effect IFF Structure (${meta.effectPath}) ---`,
+          ...effectChunks,
+          '',
+        ]
+      })()),
       `nearOverlapHitCount: ${overlapHits.length}`,
       ...overlapLines,
       '',
@@ -774,10 +893,32 @@ const PreviewCanvas = memo(function PreviewCanvas({
       debugKey?: string,
       hasUvChannel?: boolean,
       shaderPath?: string,
+      scaleU?: number,
+      scaleV?: number,
     ): void {
       const position = geometry.getAttribute('position')
+      
+      // Store UV application debug info in geometry for surface pick dump
+      const uvDebug = {
+        called: true,
+        debugKey,
+        hasPosition: Boolean(position),
+        positionCount: position?.count ?? 0,
+        hasUvs: Boolean(uvs),
+        uvsLength: uvs?.length ?? 0,
+        hasUvChannel,
+        shaderPath,
+        requiredUvLength: position ? position.count * 2 : 0,
+        earlyReturn: false,
+        earlyReturnReason: '',
+      }
+      
       if (!position || position.count === 0 || !uvs || uvs.length < position.count * 2) {
         // Data-only mode: never synthesize planar UVs.
+        uvDebug.earlyReturn = true
+        uvDebug.earlyReturnReason = !position ? 'no position' : position.count === 0 ? 'zero vertices' : !uvs ? 'no uvs' : 'insufficient uv data'
+        geometry.userData.uvDebug = uvDebug
+        
         if (debugKey && hasUvChannel !== false && !uvFallbackLoggedRef.current.has(debugKey)) {
           uvFallbackLoggedRef.current.add(debugKey)
           console.warn('[UV] Missing declared UV data; leaving mesh without UV attribute', {
@@ -789,473 +930,100 @@ const PreviewCanvas = memo(function PreviewCanvas({
         }
         return
       }
+      
+      geometry.userData.uvDebug = uvDebug
+      
+      // Store shader debug info for surface pick dump
+      if (shaderPath) {
+        const debugChunks = getShaderDebugChunks(shaderPath)
+        if (debugChunks) {
+          geometry.userData.shaderDebugChunks = debugChunks
+        }
+      }
 
       let normalizedUvs = uvs.slice(0, position.count * 2)
-      const shaderLower = shaderPath?.toLowerCase() ?? ''
-      const isTargetShader =
-        shaderLower.includes('thed_palace_window') ||
-        shaderLower.includes('thed_relief') ||
-        shaderLower.includes('thed_exterior_palace_statue')
-
-      if (isTargetShader) {
-        let minU = Number.POSITIVE_INFINITY
-        let minV = Number.POSITIVE_INFINITY
-        let maxU = Number.NEGATIVE_INFINITY
-        let maxV = Number.NEGATIVE_INFINITY
+      
+        // Calculate initial UV range
+        let minU = Number.POSITIVE_INFINITY, maxU = Number.NEGATIVE_INFINITY
+        let minV = Number.POSITIVE_INFINITY, maxV = Number.NEGATIVE_INFINITY
         for (let i = 0; i + 1 < normalizedUvs.length; i += 2) {
-          const u = normalizedUvs[i]
-          const v = normalizedUvs[i + 1]
+          const u = normalizedUvs[i], v = normalizedUvs[i + 1]
           if (!Number.isFinite(u) || !Number.isFinite(v)) continue
+          if (u < minU) minU = u; if (u > maxU) maxU = u
+          if (v < minV) minV = v; if (v > maxV) maxV = v
+        }
+      
+      // Apply shader-defined texture coordinate scales from TCSC chunk (if present)
+      // Note: Most SWG meshes don't have TCSC chunks - UV scales are baked into the UV coordinates
+      if ((scaleU && scaleU !== 1.0) || (scaleV && scaleV !== 1.0)) {
+        const uScale = scaleU ?? 1.0
+        const vScale = scaleV ?? 1.0
+        console.log(`[UV Scale] Applying TCSC shader scales: U=${uScale.toFixed(3)}, V=${vScale.toFixed(3)} to ${debugKey || 'unknown'}`)
+        for (let i = 0; i + 1 < normalizedUvs.length; i += 2) {
+          normalizedUvs[i] *= uScale
+          normalizedUvs[i + 1] *= vScale
+        }
+      }
+      
+      // Recalculate UV range for logging
+      minU = Number.POSITIVE_INFINITY
+      minV = Number.POSITIVE_INFINITY
+      maxU = Number.NEGATIVE_INFINITY
+      maxV = Number.NEGATIVE_INFINITY
+      for (let i = 0; i + 1 < normalizedUvs.length; i += 2) {
+        const u = normalizedUvs[i]
+        const v = normalizedUvs[i + 1]
+        if (Number.isFinite(u) && Number.isFinite(v)) {
           if (u < minU) minU = u
           if (u > maxU) maxU = u
           if (v < minV) minV = v
           if (v > maxV) maxV = v
         }
-
-        const rangeU = Number.isFinite(maxU) && Number.isFinite(minU) ? Math.max(0, maxU - minU) : 0
-        const rangeV = Number.isFinite(maxV) && Number.isFinite(minV) ? Math.max(0, maxV - minV) : 0
-        const longRange = Math.max(rangeU, rangeV)
-        const shortRange = Math.max(1e-6, Math.min(rangeU, rangeV))
-
-        // Upscale tiny UV spans to match working siblings in the same shader family.
-        if (longRange > 1e-6 && longRange < 1) {
-          let uniformScale = 1
-          while (longRange * uniformScale < 4) uniformScale *= 2
-          if (uniformScale > 1 && uniformScale <= 64) {
-            normalizedUvs = normalizedUvs.map((value) => value * uniformScale)
-          }
-        }
-
-        // If one axis is still much smaller, scale only that axis.
-        const anisotropy = shortRange > 1e-6 ? longRange / shortRange : 1
-        if (anisotropy > 24) {
-          const scaleU = rangeU < rangeV
-          let axisScale = 1
-          while ((longRange / (shortRange * axisScale)) > 8) axisScale *= 2
-          if (axisScale > 1 && axisScale <= 128) {
-            const expanded = normalizedUvs.slice()
-            for (let i = 0; i + 1 < expanded.length; i += 2) {
-              if (scaleU) expanded[i] *= axisScale
-              else expanded[i + 1] *= axisScale
-            }
-            normalizedUvs = expanded
-          }
-        }
-
       }
-
+      
+      console.log(`[UV Apply] ${debugKey || 'unknown'}:`)
+      console.log(`  Vertex count: ${position.count}, UV pairs: ${normalizedUvs.length / 2}`)
+      console.log(`  UV Range: U[${minU.toFixed(3)}, ${maxU.toFixed(3)}], V[${minV.toFixed(3)}, ${maxV.toFixed(3)}]`)
+      console.log(`  UV Tiling: ~${Math.abs(maxU - minU).toFixed(1)}x horizontal, ~${Math.abs(maxV - minV).toFixed(1)}x vertical`)
+      console.log(`  Shader: ${shaderPath || 'none'}`)
+      console.log(`  TCSC scales applied: ${scaleU ? 'U=' + scaleU.toFixed(3) : 'none'}, ${scaleV ? 'V=' + scaleV.toFixed(3) : 'none'}`)
+      
       geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(normalizedUvs), 2))
     }
 
     function pickUvSet(part: { positions: number[]; uvs?: number[]; uvs1?: number[]; uvSets?: number[][] }, uvSetIndex?: number): number[] | undefined {
       const vertexCount = Math.floor(part.positions.length / 3)
-      const uvStats = (uvs?: number[]): { quality: number; maxAbs: number; rangeU: number; rangeV: number } => {
-        if (!uvs || uvs.length < vertexCount * 2) {
-          return {
-            quality: Number.NEGATIVE_INFINITY,
-            maxAbs: Number.POSITIVE_INFINITY,
-            rangeU: 0,
-            rangeV: 0,
-          }
-        }
-        let minU = Number.POSITIVE_INFINITY
-        let minV = Number.POSITIVE_INFINITY
-        let maxU = Number.NEGATIVE_INFINITY
-        let maxV = Number.NEGATIVE_INFINITY
-        let maxAbs = 0
-        for (let i = 0; i + 1 < vertexCount * 2; i += 2) {
-          const u = uvs[i]
-          const v = uvs[i + 1]
-          if (!Number.isFinite(u) || !Number.isFinite(v)) {
-            return {
-              quality: Number.NEGATIVE_INFINITY,
-              maxAbs: Number.POSITIVE_INFINITY,
-              rangeU: 0,
-              rangeV: 0,
-            }
-          }
-          // Guard against sentinel/garbage float payloads.
-          if (Math.abs(u) > 1_000_000 || Math.abs(v) > 1_000_000) {
-            return {
-              quality: Number.NEGATIVE_INFINITY,
-              maxAbs: Number.POSITIVE_INFINITY,
-              rangeU: 0,
-              rangeV: 0,
-            }
-          }
-          maxAbs = Math.max(maxAbs, Math.abs(u), Math.abs(v))
-          if (u < minU) minU = u
-          if (u > maxU) maxU = u
-          if (v < minV) minV = v
-          if (v > maxV) maxV = v
-        }
-        const rangeU = Math.max(0, maxU - minU)
-        const rangeV = Math.max(0, maxV - minV)
-        if (rangeU < 1e-7 && rangeV < 1e-7) {
-          return { quality: Number.NEGATIVE_INFINITY, maxAbs, rangeU, rangeV }
-        }
-        const quality = rangeU * rangeV + Math.max(rangeU, rangeV) * 0.01
-        return { quality, maxAbs, rangeU, rangeV }
-      }
+      const required = vertexCount * 2
+      const valid = (set?: number[]) => Boolean(set && set.length >= required)
 
-      const candidateSets: Array<{
-        set: number[]
-        quality: number
-        maxAbs: number
-        rangeU: number
-        rangeV: number
-        index: number
-      }> = []
-      const pushCandidate = (index: number, set?: number[]) => {
-        if (!set) return
-        const stats = uvStats(set)
-        if (!Number.isFinite(stats.quality)) return
-        candidateSets.push({
-          set,
-          quality: stats.quality,
-          maxAbs: stats.maxAbs,
-          rangeU: stats.rangeU,
-          rangeV: stats.rangeV,
-          index,
-        })
+      // Deterministic resolution order:
+      // 1) explicit requested set index
+      // 2) legacy named channel for index 0/1
+      // 3) first declared set in deterministic order (uvSets[0], then uvs, then uvs1)
+      if (uvSetIndex !== undefined) {
+        if (part.uvSets && uvSetIndex >= 0 && uvSetIndex < part.uvSets.length && valid(part.uvSets[uvSetIndex])) {
+          return part.uvSets[uvSetIndex]
+        }
+        if (uvSetIndex === 0 && valid(part.uvs)) return part.uvs
+        if (uvSetIndex === 1 && valid(part.uvs1)) return part.uvs1
       }
 
       if (part.uvSets) {
-        for (let i = 0; i < part.uvSets.length; i += 1) {
-          pushCandidate(i, part.uvSets[i])
+        for (const set of part.uvSets) {
+          if (valid(set)) return set
         }
       }
-      pushCandidate(0, part.uvs)
-      pushCandidate(1, part.uvs1)
-
-      if (candidateSets.length === 0) return undefined
-
-      if (uvSetIndex !== undefined) {
-        const declared = candidateSets.find((candidate) => candidate.index === uvSetIndex)
-        // Keep declared UV set when sane; fall back when declared UVs are clearly pathological.
-        if (declared && declared.maxAbs <= 32) return declared.set
-      }
-
-      candidateSets.sort((a, b) => b.quality - a.quality)
-      return candidateSets[0].set
+      if (valid(part.uvs)) return part.uvs
+      if (valid(part.uvs1)) return part.uvs1
+      return undefined
     }
 
     function pickUvSetForShader(
       part: { positions: number[]; uvs?: number[]; uvs1?: number[]; uvSets?: number[][] },
       uvSetIndex: number | undefined,
-      shaderPath?: string,
+      _shaderPath?: string,
     ): number[] | undefined {
-      const picked = pickUvSet(part, uvSetIndex)
-      if (!picked || !shaderPath) return picked
-
-      const shaderLower = shaderPath.toLowerCase()
-      const isTargetShader =
-        shaderLower.includes('thed_palace_window') ||
-        shaderLower.includes('thed_relief') ||
-        shaderLower.includes('thed_exterior_palace_statue')
-      if (!isTargetShader) return picked
-
-      const vertexCount = Math.floor(part.positions.length / 3)
-      const candidates: Array<{ set: number[]; index: number; rangeU: number; rangeV: number; score: number }> = []
-      const collect = (index: number, set?: number[]) => {
-        if (!set || set.length < vertexCount * 2) return
-        let minU = Number.POSITIVE_INFINITY
-        let minV = Number.POSITIVE_INFINITY
-        let maxU = Number.NEGATIVE_INFINITY
-        let maxV = Number.NEGATIVE_INFINITY
-        for (let i = 0; i + 1 < vertexCount * 2; i += 2) {
-          const u = set[i]
-          const v = set[i + 1]
-          if (!Number.isFinite(u) || !Number.isFinite(v)) return
-          if (u < minU) minU = u
-          if (u > maxU) maxU = u
-          if (v < minV) minV = v
-          if (v > maxV) maxV = v
-        }
-        const rangeU = Math.max(0, maxU - minU)
-        const rangeV = Math.max(0, maxV - minV)
-        if (rangeU < 1e-7 && rangeV < 1e-7) return
-        const long = Math.max(rangeU, rangeV)
-        const short = Math.max(1e-6, Math.min(rangeU, rangeV))
-        const anisotropy = long / short
-        const score = (rangeU * rangeV) - anisotropy * 0.25
-        candidates.push({ set, index, rangeU, rangeV, score })
-      }
-
-      if (part.uvSets) {
-        for (let i = 0; i < part.uvSets.length; i += 1) {
-          collect(i, part.uvSets[i])
-        }
-      }
-      collect(0, part.uvs)
-      collect(1, part.uvs1)
-
-      if (candidates.length === 0) return picked
-
-      const declared = uvSetIndex !== undefined
-        ? candidates.find((candidate) => candidate.index === uvSetIndex)
-        : undefined
-
-      if (!declared) {
-        candidates.sort((a, b) => b.score - a.score)
-        return candidates[0].set
-      }
-
-      const declaredLong = Math.max(declared.rangeU, declared.rangeV)
-      const declaredShort = Math.max(1e-6, Math.min(declared.rangeU, declared.rangeV))
-      const declaredAnisotropy = declaredLong / declaredShort
-      if (declaredAnisotropy <= 12) return declared.set
-
-      const better = [...candidates]
-        .filter((candidate) => candidate.index !== declared.index)
-        .sort((a, b) => b.score - a.score)[0]
-      return better?.set ?? declared.set
-    }
-
-    const measureUvRange = (uvs?: number[]): { rangeU: number; rangeV: number } | undefined => {
-      if (!uvs || uvs.length < 4) return undefined
-      let minU = Number.POSITIVE_INFINITY
-      let minV = Number.POSITIVE_INFINITY
-      let maxU = Number.NEGATIVE_INFINITY
-      let maxV = Number.NEGATIVE_INFINITY
-      for (let i = 0; i + 1 < uvs.length; i += 2) {
-        const u = uvs[i]
-        const v = uvs[i + 1]
-        if (!Number.isFinite(u) || !Number.isFinite(v)) continue
-        if (u < minU) minU = u
-        if (u > maxU) maxU = u
-        if (v < minV) minV = v
-        if (v > maxV) maxV = v
-      }
-      if (!Number.isFinite(minU) || !Number.isFinite(minV) || !Number.isFinite(maxU) || !Number.isFinite(maxV)) {
-        return undefined
-      }
-      return {
-        rangeU: Math.max(0, maxU - minU),
-        rangeV: Math.max(0, maxV - minV),
-      }
-    }
-
-    type UvCalibrationTarget = {
-      rangeU: number
-      rangeV: number
-      source: string
-    }
-
-    type UvCalibrationResult = {
-      uvs: number[] | undefined
-      transform: string
-      scaleU: number
-      scaleV: number
-      targetSource?: string
-    }
-
-    const transformUvs = (
-      uvs: number[],
-      transform: 'identity' | 'flipU' | 'flipV' | 'swap' | 'swapFlipU' | 'swapFlipV',
-    ): number[] => {
-      if (transform === 'identity') return uvs.slice()
-      const out = uvs.slice()
-      for (let i = 0; i + 1 < out.length; i += 2) {
-        const u = out[i]
-        const v = out[i + 1]
-        if (transform === 'flipU') {
-          out[i] = -u
-        } else if (transform === 'flipV') {
-          out[i + 1] = -v
-        } else if (transform === 'swap') {
-          out[i] = v
-          out[i + 1] = u
-        } else if (transform === 'swapFlipU') {
-          out[i] = -v
-          out[i + 1] = u
-        } else if (transform === 'swapFlipV') {
-          out[i] = v
-          out[i + 1] = -u
-        }
-      }
-      return out
-    }
-
-    const calibrateUvsToTarget = (
-      uvs: number[] | undefined,
-      target?: UvCalibrationTarget,
-    ): UvCalibrationResult => {
-      if (!uvs || !target) {
-        return {
-          uvs,
-          transform: 'identity',
-          scaleU: 1,
-          scaleV: 1,
-          targetSource: target?.source,
-        }
-      }
-
-      const measured = measureUvRange(uvs)
-      if (!measured || measured.rangeU < 1e-6 || measured.rangeV < 1e-6) {
-        return {
-          uvs,
-          transform: 'identity',
-          scaleU: 1,
-          scaleV: 1,
-          targetSource: target.source,
-        }
-      }
-
-      const transforms: Array<'identity' | 'flipU' | 'flipV' | 'swap' | 'swapFlipU' | 'swapFlipV'> = [
-        'identity',
-        'flipU',
-        'flipV',
-        'swap',
-        'swapFlipU',
-        'swapFlipV',
-      ]
-
-      let best: UvCalibrationResult & { score: number } | undefined
-      const targetRatio = target.rangeV > 1e-6 ? target.rangeU / target.rangeV : 1
-      const safeLog = (value: number) => Math.abs(Math.log(Math.max(1e-6, value)))
-
-      for (const transform of transforms) {
-        const transformed = transformUvs(uvs, transform)
-        const candidateRange = measureUvRange(transformed)
-        if (!candidateRange || candidateRange.rangeU < 1e-6 || candidateRange.rangeV < 1e-6) continue
-
-        const rawScaleU = target.rangeU / candidateRange.rangeU
-        const rawScaleV = target.rangeV / candidateRange.rangeV
-        const scaleU = Math.min(8, Math.max(0.125, rawScaleU))
-        const scaleV = Math.min(8, Math.max(0.125, rawScaleV))
-
-        const shouldScaleU = scaleU > 1.35 || scaleU < 0.74
-        const shouldScaleV = scaleV > 1.35 || scaleV < 0.74
-
-        const out = transformed.slice()
-        for (let i = 0; i + 1 < out.length; i += 2) {
-          if (shouldScaleU) out[i] *= scaleU
-          if (shouldScaleV) out[i + 1] *= scaleV
-        }
-
-        const postRange = measureUvRange(out)
-        if (!postRange || postRange.rangeU < 1e-6 || postRange.rangeV < 1e-6) continue
-
-        const candidateRatio = candidateRange.rangeV > 1e-6 ? candidateRange.rangeU / candidateRange.rangeV : 1
-        const ratioPenalty = safeLog(candidateRatio / targetRatio)
-        const scalePenalty = safeLog(scaleU) + safeLog(scaleV)
-        const rangePenalty = safeLog(postRange.rangeU / target.rangeU) + safeLog(postRange.rangeV / target.rangeV)
-        const score = ratioPenalty * 1.8 + scalePenalty + rangePenalty * 0.5
-
-        if (!best || score < best.score) {
-          best = {
-            uvs: out,
-            transform,
-            scaleU: shouldScaleU ? scaleU : 1,
-            scaleV: shouldScaleV ? scaleV : 1,
-            targetSource: target.source,
-            score,
-          }
-        }
-      }
-
-      if (!best) {
-        return {
-          uvs,
-          transform: 'identity',
-          scaleU: 1,
-          scaleV: 1,
-          targetSource: target.source,
-        }
-      }
-
-      return {
-        uvs: best.uvs,
-        transform: best.transform,
-        scaleU: best.scaleU,
-        scaleV: best.scaleV,
-        targetSource: best.targetSource,
-      }
-    }
-
-    function stabilizeExteriorUvsForShader(uvs: number[] | undefined, shaderPath?: string): number[] | undefined {
-      if (!uvs || !shaderPath) return uvs
-      const shaderLower = shaderPath.toLowerCase()
-      const isTargetShader =
-        shaderLower.includes('thed_palace_window') ||
-        shaderLower.includes('thed_relief') ||
-        shaderLower.includes('thed_exterior_palace_statue')
-      if (!isTargetShader) return uvs
-
-      let minU = Number.POSITIVE_INFINITY
-      let minV = Number.POSITIVE_INFINITY
-      let maxU = Number.NEGATIVE_INFINITY
-      let maxV = Number.NEGATIVE_INFINITY
-      let maxAbs = 0
-      for (let i = 0; i + 1 < uvs.length; i += 2) {
-        const u = uvs[i]
-        const v = uvs[i + 1]
-        const value = Math.max(Math.abs(u), Math.abs(v))
-        if (!Number.isFinite(u) || !Number.isFinite(v)) return uvs
-        if (!Number.isFinite(value)) return uvs
-        if (u < minU) minU = u
-        if (u > maxU) maxU = u
-        if (v < minV) minV = v
-        if (v > maxV) maxV = v
-        maxAbs = Math.max(maxAbs, Math.abs(value))
-      }
-
-      const rangeU = Math.max(0, maxU - minU)
-      const rangeV = Math.max(0, maxV - minV)
-      if (rangeU > 1e-6 && rangeV > 1e-6) {
-        const longRange = Math.max(rangeU, rangeV)
-        const shortRange = Math.max(1e-6, Math.min(rangeU, rangeV))
-        const anisotropy = longRange / shortRange
-
-        if (anisotropy > 24) {
-          let axisScale = 1
-          while ((longRange / (shortRange * axisScale)) > 8) axisScale *= 2
-          if (axisScale > 1 && axisScale <= 128) {
-            const expandU = rangeU < rangeV
-            const expanded = uvs.slice()
-            for (let i = 0; i + 1 < expanded.length; i += 2) {
-              if (expandU) expanded[i] *= axisScale
-              else expanded[i + 1] *= axisScale
-            }
-            uvs = expanded
-            maxAbs *= axisScale
-          }
-        }
-      }
-
-      // Some affected exterior parts decode with very small but valid UV ranges
-      // (e.g. ~0.1..0.5), while working sibling parts for the same shader family
-      // are in repeat ranges around ~4..12. Promote tiny spans using power-of-two
-      // scaling so bad parts align with good siblings without touching sane parts.
-      const postRangeU = Math.max(0, maxU - minU)
-      const postRangeV = Math.max(0, maxV - minV)
-      const postLongRange = Math.max(postRangeU, postRangeV)
-      if (postLongRange > 1e-6 && postLongRange < 1) {
-        let uniformScale = 1
-        while (postLongRange * uniformScale < 4) uniformScale *= 2
-        if (uniformScale > 1 && uniformScale <= 64) {
-          const expanded = uvs.map((value) => value * uniformScale)
-          uvs = expanded
-          maxAbs *= uniformScale
-        }
-      }
-
-      // Keep authored UVs when already in a sane range.
-      if (maxAbs <= 16) return uvs
-
-      // Downscale pathological UV magnitudes by powers of two until comparable to known-good parts.
-      let scale = 1
-      while (maxAbs / scale > 8) scale *= 2
-      if (scale <= 1) return uvs
-      return uvs.map((value) => value / scale)
-    }
-
-    const isExteriorCalibrationShader = (shaderPath?: string): boolean => {
-      const shaderLower = shaderPath?.toLowerCase() ?? ''
-      return shaderLower.includes('thed_palace_window') ||
-        shaderLower.includes('thed_relief') ||
-        shaderLower.includes('thed_exterior_palace_statue')
+      return pickUvSet(part, uvSetIndex)
     }
 
     const pendingTextureLoads = new Set<string>()
@@ -1265,6 +1033,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
     // Expose the current applyTextureToMaterial closure so the renderTextures toggle
     // effect can reapply textures without triggering a full rebuild.
     applyTextureToMaterialRef.current = applyTextureToMaterial
+    applyStoredShaderMaterialStateRef.current = applyStoredShaderMaterialState
 
     const isMaterialUsable = (material: THREE.Material): boolean => {
       if (previewBuildEpochRef.current !== buildEpoch) return false
@@ -1402,8 +1171,15 @@ const PreviewCanvas = memo(function PreviewCanvas({
         return THREE.LinearFilter
       }
 
-      // UV extraction already applies SWG V-orientation conversion; keep Three's upload flip enabled.
-      texture.flipY = true
+      // DDS/TGA loaders handle orientation correctly - flipY should be false for pre-flipped formats
+      // but true for standard formats like PNG/JPG. Let loaders set this automatically.
+      // Most DDS/TGA files are already in the correct orientation for OpenGL.
+      if (texturePath) {
+        const lower = texturePath.toLowerCase()
+        // DDS and TGA files are typically pre-flipped for Direct3D/OpenGL
+        texture.flipY = !(lower.endsWith('.dds') || lower.endsWith('.tga'))
+      }
+      
       if (texturePath) {
         texture.userData = {
           ...(texture.userData ?? {}),
@@ -1413,6 +1189,11 @@ const PreviewCanvas = memo(function PreviewCanvas({
       texture.colorSpace = mode === 'normal' ? THREE.NoColorSpace : THREE.SRGBColorSpace
       texture.wrapS = toThreeWrapping(addressU)
       texture.wrapT = toThreeWrapping(addressV)
+      
+      // CRITICAL: Keep texture.repeat at (1,1) so UV coordinates control tiling
+      texture.repeat.set(1, 1)
+      texture.offset.set(0, 0)
+      
       texture.minFilter = toThreeMinFilter(mipmapFilter, minificationFilter)
       texture.magFilter = toThreeMagFilter(magnificationFilter)
       const maxAniso = rendererRef.current?.capabilities.getMaxAnisotropy() ?? 1
@@ -1422,6 +1203,12 @@ const PreviewCanvas = memo(function PreviewCanvas({
         magnificationFilter === 'anisotropic'
       texture.anisotropy = requestedAniso ? Math.min(maxAniso, 16) : 1
       texture.needsUpdate = true
+      
+      console.log(`[Texture Config] ${texturePath || 'unknown'}:`)
+      console.log(`  Mode: ${mode}, ColorSpace: ${texture.colorSpace === THREE.SRGBColorSpace ? 'SRGB' : 'NoColorSpace'}`)
+      console.log(`  Wrap: U=${addressU || 'wrap'}, V=${addressV || 'wrap'}`)
+      console.log(`  Filter: Mip=${mipmapFilter || 'linear'}, Min=${minificationFilter || 'linear'}, Mag=${magnificationFilter || 'linear'}`)
+      console.log(`  Anisotropy: ${texture.anisotropy}, FlipY: ${texture.flipY}, Repeat: (${texture.repeat.x}, ${texture.repeat.y})`)
     }
 
     function applyTextureToMaterial(
@@ -1464,6 +1251,39 @@ const PreviewCanvas = memo(function PreviewCanvas({
       }
 
       const key = textureMeta.url
+      if (_attempted.has(key)) return
+
+      const findAlternateTextureMeta = (): ResolvedTextureMap[string] | undefined => {
+        if (!textureMeta?.texturePath) return undefined
+        if (textureMeta.alternateUrl && textureMeta.alternateTexturePath && textureMeta.alternateUrl !== key) {
+          return {
+            ...textureMeta,
+            url: textureMeta.alternateUrl,
+            texturePath: textureMeta.alternateTexturePath,
+            alternateUrl: key,
+            alternateTexturePath: textureMeta.texturePath,
+          }
+        }
+
+        const currentPath = textureMeta.texturePath.toLowerCase()
+        const alternates = altTextureCandidates(currentPath).filter((value) => value !== currentPath)
+        if (alternates.length === 0) return undefined
+
+        const allEntries = Object.values(resolvedTextures)
+        for (const altPath of alternates) {
+          const direct = allEntries.find((entry) => entry?.texturePath?.toLowerCase() === altPath)
+          if (direct && direct.url !== key) return direct
+        }
+
+        // Fallback by filename if path prefix differs but basename matches.
+        const altFiles = new Set(alternates.map((value) => value.split('/').pop() ?? value))
+        return allEntries.find((entry) => {
+          if (!entry?.texturePath || entry.url === key) return false
+          const file = entry.texturePath.toLowerCase().split('/').pop() ?? entry.texturePath.toLowerCase()
+          return altFiles.has(file)
+        })
+      }
+
       const cached = textureCacheRef.current.get(key)
       if (cached && isTextureRenderable(cached)) {
         material.map = cached
@@ -1531,11 +1351,17 @@ const PreviewCanvas = memo(function PreviewCanvas({
           : textureLoaderRef.current
       if (!loader) return
 
+      console.log(`[Texture Load] Loading texture for ${templatePath}:`)
+      console.log(`[Texture Load]   Path: ${textureMeta.texturePath}`)
+      console.log(`[Texture Load]   URL: ${key}`)
+      console.log(`[Texture Load]   Context: ${context}`)
+      
       pendingTextureLoads.add(key)
       loader.load(
         key,
         (texture: THREE.Texture) => {
           pendingTextureLoads.delete(key)
+          console.log(`[Texture Load] \u2713 Successfully loaded: ${textureMeta.texturePath}`)
           if (!isMaterialUsable(material)) {
             texture.dispose()
             return
@@ -1577,6 +1403,8 @@ const PreviewCanvas = memo(function PreviewCanvas({
 
             cacheTexture(key, texture)
           material.map = texture
+          material.needsUpdate = true
+          console.log(`[Texture Apply] Applied color texture to material: ${textureMeta.texturePath}`)
 
           const applyNormalFromMeta = (normalMetaUrl: string, normalTexturePath: string) => {
             const cachedNormal = textureCacheRef.current.get(normalMetaUrl)
@@ -1627,11 +1455,14 @@ const PreviewCanvas = memo(function PreviewCanvas({
           }
 
           if (textureMeta.normalUrl && textureMeta.normalTexturePath) {
+            console.log(`[Normal Map] Applying normal map: ${textureMeta.normalTexturePath}`)
             applyNormalFromMeta(textureMeta.normalUrl, textureMeta.normalTexturePath)
           }
 
           // ATED is a detail stage; use a conservative MODULATE blend (not 2X) for closer SWG parity.
           if (textureMeta.secondaryUrl && textureMeta.secondaryTexturePath && !material.userData.blendInjected) {
+            console.log(`[Secondary Texture] Applying secondary/detail texture: ${textureMeta.secondaryTexturePath}`)
+            console.log(`[Secondary Texture]   Blend mode: MODULATE (diffuseColor.rgb *= secondary.rgb)`)
             material.userData.blendInjected = true
             const map2Ref: { current: THREE.Texture | null } = { current: null }
             material.userData.map2Ref = map2Ref
@@ -1695,16 +1526,33 @@ const PreviewCanvas = memo(function PreviewCanvas({
             }
           }
 
-          material.transparent = false
-          material.opacity = 1
-          material.depthWrite = true
           requestRenderRef.current()
         },
         undefined,
         () => {
           pendingTextureLoads.delete(key)
+
+          const alternate = findAlternateTextureMeta()
+          if (alternate && templatePath) {
+            resolvedTextureAliasRef.current.set(templatePath, alternate)
+            const nextAttempted = new Set(_attempted)
+            nextAttempted.add(key)
+            console.warn('[Texture] Primary texture load failed, retrying alternate extension', {
+              templatePath,
+              failedTexturePath: textureMeta.texturePath,
+              alternateTexturePath: alternate.texturePath,
+              context,
+            })
+            applyTextureToMaterial(templatePath, material, context, nextAttempted)
+            return
+          }
+
           if (!rejectedTexturePathsRef.current.has(textureMeta.texturePath)) {
             rejectedTexturePathsRef.current.add(textureMeta.texturePath)
+            console.error(`[Texture Load] \u2717 Failed to load texture for ${templatePath}:`)
+            console.error(`[Texture Load]   Path: ${textureMeta.texturePath}`)
+            console.error(`[Texture Load]   URL: ${key}`)
+            console.error(`[Texture Load]   Context: ${context}`)
             console.warn('[Texture] Failed to load texture', {
               templatePath,
               texturePath: textureMeta.texturePath,
@@ -1714,6 +1562,70 @@ const PreviewCanvas = memo(function PreviewCanvas({
           }
         },
       )
+    }
+
+    function applyShaderRenderSettings(
+      material: THREE.MeshPhongMaterial,
+      shaderPath?: string,
+    ): void {
+      if (!shaderPath) return
+      const props = getShaderRenderProps(shaderPath)
+      if (!props) return
+
+      const hasPunchout = props.effectTags.some((tag) => tag === 'PNCH' || tag === 'PUNCHOUT')
+      if (props.alphaTest || hasPunchout) {
+        const alphaRef = props.alphaReference > 0 ? props.alphaReference : (hasPunchout ? 128 : 0)
+        material.alphaTest = THREE.MathUtils.clamp(alphaRef / 255, 0, 1)
+      } else {
+        material.alphaTest = 0
+      }
+
+      if (props.transparent || props.alphaBlend) {
+        material.transparent = true
+        material.depthWrite = false
+      } else {
+        material.depthWrite = true
+      }
+
+      const hasAdditive = props.effectTags.some((tag) => tag === 'ADDT' || tag === 'ADDITIVE' || tag === 'ADD')
+      if (hasAdditive) {
+        material.blending = THREE.AdditiveBlending
+        material.transparent = true
+        material.depthWrite = false
+      } else {
+        material.blending = THREE.NormalBlending
+      }
+
+      material.userData = {
+        ...material.userData,
+        shaderAlphaTest: props.alphaTest,
+        shaderAlphaReference: props.alphaReference,
+        shaderTransparent: props.transparent,
+        shaderAlphaBlend: props.alphaBlend,
+        shaderEffectTags: props.effectTags,
+      }
+    }
+
+    function applyStoredShaderMaterialState(material: THREE.MeshPhongMaterial): void {
+      const alphaTest = Boolean(material.userData?.shaderAlphaTest)
+      const alphaRef = Number(material.userData?.shaderAlphaReference ?? 0)
+      const effectTags = Array.isArray(material.userData?.shaderEffectTags)
+        ? (material.userData.shaderEffectTags as string[])
+        : []
+      const hasPunchout = effectTags.some((tag) => tag === 'PNCH' || tag === 'PUNCHOUT')
+      if (alphaTest || hasPunchout) {
+        const ref = alphaRef > 0 ? alphaRef : (hasPunchout ? 128 : 0)
+        material.alphaTest = THREE.MathUtils.clamp(ref / 255, 0, 1)
+      } else {
+        material.alphaTest = 0
+      }
+
+      const isTransparent = Boolean(material.userData?.shaderTransparent) || Boolean(material.userData?.shaderAlphaBlend)
+      const hasAdditive = effectTags.some((tag) => tag === 'ADDT' || tag === 'ADDITIVE' || tag === 'ADD')
+      material.transparent = isTransparent || hasAdditive
+      material.blending = hasAdditive ? THREE.AdditiveBlending : THREE.NormalBlending
+      material.depthWrite = !(material.transparent)
+      material.opacity = 1
     }
 
     const footprintGeometry = new THREE.BoxGeometry(building.width, 0.28, building.depth)
@@ -1762,68 +1674,6 @@ const PreviewCanvas = memo(function PreviewCanvas({
           ? rootVisual.meshParts
           : [rootVisual.mesh]
 
-        const familyUvTargets = new Map<string, UvCalibrationTarget>()
-        const shaderUvTargets = new Map<string, UvCalibrationTarget>()
-        {
-          const groupedByFamily = new Map<string, Array<{ rangeU: number; rangeV: number }>>()
-          const groupedByShader = new Map<string, Array<{ rangeU: number; rangeV: number }>>()
-          for (let partIndex = 0; partIndex < rootPartMeshes.length; partIndex += 1) {
-            const part = rootPartMeshes[partIndex]
-            if (!part || part.positions.length < 9 || part.indices.length < 3) continue
-            const shaderPath = rootVisual.meshPartShaderPaths?.[partIndex] ?? ''
-            const partDomain = rootVisual.meshPartDomains?.[partIndex] ?? 'exterior'
-            const texturePath = rootVisual.meshPartTexturePaths?.[partIndex] ?? ''
-            if (!shaderPath || partDomain !== 'exterior' || !isExteriorCalibrationShader(shaderPath)) continue
-
-            const primaryUvSetIndex = rootVisual.meshPartPrimaryUvSetIndices?.[partIndex] ?? 0
-            const candidateUvs = pickUvSetForShader(part, primaryUvSetIndex, shaderPath)
-            const measured = measureUvRange(candidateUvs)
-            if (!measured) continue
-            const longRange = Math.max(measured.rangeU, measured.rangeV)
-            const shortRange = Math.min(measured.rangeU, measured.rangeV)
-            if (longRange < 0.25 || longRange > 64 || shortRange < 1e-6) continue
-
-            const shaderKey = shaderPath.toLowerCase()
-            const shaderBucket = groupedByShader.get(shaderKey) ?? []
-            shaderBucket.push(measured)
-            groupedByShader.set(shaderKey, shaderBucket)
-
-            if (texturePath) {
-              const familyKey = `${shaderKey}|${texturePath.toLowerCase()}`
-              const familyBucket = groupedByFamily.get(familyKey) ?? []
-              familyBucket.push(measured)
-              groupedByFamily.set(familyKey, familyBucket)
-            }
-          }
-
-          const median = (values: number[]): number => {
-            const sorted = [...values].sort((a, b) => a - b)
-            const mid = Math.floor(sorted.length / 2)
-            if (sorted.length % 2 === 1) return sorted[mid]
-            return (sorted[mid - 1] + sorted[mid]) / 2
-          }
-
-          for (const [familyKey, ranges] of groupedByFamily) {
-            if (ranges.length < 2) continue
-            const target = {
-              rangeU: median(ranges.map((r) => r.rangeU)),
-              rangeV: median(ranges.map((r) => r.rangeV)),
-              source: `family:${familyKey}`,
-            }
-            familyUvTargets.set(familyKey, target)
-          }
-
-          for (const [shaderKey, ranges] of groupedByShader) {
-            if (ranges.length < 2) continue
-            const target = {
-              rangeU: median(ranges.map((r) => r.rangeU)),
-              rangeV: median(ranges.map((r) => r.rangeV)),
-              source: `shader:${shaderKey}`,
-            }
-            shaderUvTargets.set(shaderKey, target)
-          }
-        }
-
         for (let partIndex = 0; partIndex < rootPartMeshes.length; partIndex += 1) {
           const part = rootPartMeshes[partIndex]
           if (!part || part.positions.length < 9 || part.indices.length < 3) continue
@@ -1841,40 +1691,44 @@ const PreviewCanvas = memo(function PreviewCanvas({
           const primaryUvSetIndex = rootVisual.meshPartPrimaryUvSetIndices?.[partIndex] ?? 0
           const shaderPath = rootVisual.meshPartShaderPaths?.[partIndex]
           const partDomain = rootVisual.meshPartDomains?.[partIndex] ?? 'exterior'
-          const texturePath = rootVisual.meshPartTexturePaths?.[partIndex]
-          const familyKey = shaderPath && texturePath
-            ? `${shaderPath.toLowerCase()}|${texturePath.toLowerCase()}`
-            : undefined
-          const shouldCalibrate = partDomain === 'exterior' && isExteriorCalibrationShader(shaderPath)
-          const uvTarget = shouldCalibrate
-            ? (familyKey
-              ? (familyUvTargets.get(familyKey) ?? (shaderPath ? shaderUvTargets.get(shaderPath.toLowerCase()) : undefined))
-              : (shaderPath ? shaderUvTargets.get(shaderPath.toLowerCase()) : undefined))
-            : undefined
-          const calibratedPrimary = calibrateUvsToTarget(stabilizeExteriorUvsForShader(
-            pickUvSetForShader(part, primaryUvSetIndex, rootVisual.meshPartShaderPaths?.[partIndex]),
+          const primaryUvs = pickUvSetForShader(
+            part,
+            primaryUvSetIndex,
             rootVisual.meshPartShaderPaths?.[partIndex],
-          ), uvTarget)
-          const primaryUvs = calibratedPrimary.uvs
+          )
+          const primaryScaleU = rootVisual.meshPartPrimaryScaleU?.[partIndex]
+          const primaryScaleV = rootVisual.meshPartPrimaryScaleV?.[partIndex]
           applyMeshUvs(
             partGeometry,
             primaryUvs,
             partTextureKey ?? rootTemplateKey,
             part.hasUvChannel,
             rootVisual.meshPartShaderPaths?.[partIndex],
+            primaryScaleU,
+            primaryScaleV,
           )
 
           // Assign secondary UVs (uv2) using TCSS slot mapping when available.
           const secondaryUvSetIndex = rootVisual.meshPartSecondaryUvSetIndices?.[partIndex] ?? 0
-          const secondaryUvs = stabilizeExteriorUvsForShader(
-            pickUvSetForShader(part, secondaryUvSetIndex, rootVisual.meshPartShaderPaths?.[partIndex]),
-            rootVisual.meshPartShaderPaths?.[partIndex],
-          )
+          const secondaryUvs = pickUvSetForShader(part, secondaryUvSetIndex, rootVisual.meshPartShaderPaths?.[partIndex])
           if (secondaryUvs && secondaryUvs.length >= Math.floor(part.positions.length / 3) * 2) {
             partGeometry.setAttribute('uv2', new THREE.BufferAttribute(
               new Float32Array(secondaryUvs.slice(0, Math.floor(part.positions.length / 3) * 2)),
               2,
             ))
+          }
+          // DEBUG: expose every authored UV set as uv3/uv4/... so the surface dump can show them.
+          if (part.uvSets && part.uvSets.length > 0) {
+            const vc = Math.floor(part.positions.length / 3)
+            for (let setIdx = 0; setIdx < part.uvSets.length; setIdx += 1) {
+              const src = part.uvSets[setIdx]
+              if (!src || src.length < vc * 2) continue
+              const attrName = `uv${setIdx + 3}` // uv3 = uvSets[0], uv4 = uvSets[1], etc.
+              partGeometry.setAttribute(
+                attrName,
+                new THREE.BufferAttribute(new Float32Array(src.slice(0, vc * 2)), 2),
+              )
+            }
           }
           if (part.normals && part.normals.length === part.positions.length) {
             partGeometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(part.normals), 3))
@@ -1882,6 +1736,10 @@ const PreviewCanvas = memo(function PreviewCanvas({
             partGeometry.computeVertexNormals()
           }
           partGeometry.translate(-center.x, -rootBounds.min.y, -center.z)
+          // DEBUG: stash the MSH decoder summary on the geometry so the surface dump can show it.
+          if (part.decodeDebug) {
+            partGeometry.userData = { ...partGeometry.userData, decodeDebug: part.decodeDebug }
+          }
 
           const partMaterial = new THREE.MeshPhongMaterial({
             color: '#ffffff',
@@ -1894,6 +1752,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
             opacity: interiorAssist && !renderTexturesRef.current ? interiorOpacityRef.current : 1,
             depthWrite: true,
           })
+          applyShaderRenderSettings(partMaterial, shaderPath)
 
           if (partDomain === 'interior') {
             // Keep interior overlays from competing with exterior shell surfaces.
@@ -1933,7 +1792,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
               meshPath: rootVisual.meshPath,
               appearancePath: rootVisual.appearancePath,
               shaderPath: rootVisual.meshPartShaderPaths?.[partIndex] ?? rootVisual.shaderPath,
-              effectPath: rootVisual.effectPath,
+              effectPath: rootVisual.meshPartEffectPaths?.[partIndex] ?? rootVisual.effectPath,
               sourceLabel: rootVisual.sourceLabel,
               textureLookupKey: (rootVisual.meshPartTexturePaths && rootVisual.meshPartTexturePaths[partIndex])
                 ? partTextureKey
@@ -1952,10 +1811,10 @@ const PreviewCanvas = memo(function PreviewCanvas({
               detailAddressU: rootVisual.meshPartSecondaryTextureAddressU?.[partIndex],
               detailAddressV: rootVisual.meshPartSecondaryTextureAddressV?.[partIndex],
               chunkTrace: rootVisual.meshPartChunkTrace?.[partIndex],
-              uvCalibrationTransform: calibratedPrimary.transform,
-              uvCalibrationScaleU: calibratedPrimary.scaleU,
-              uvCalibrationScaleV: calibratedPrimary.scaleV,
-              uvCalibrationTargetSource: calibratedPrimary.targetSource,
+              uvCalibrationTransform: 'identity',
+              uvCalibrationScaleU: 1,
+              uvCalibrationScaleV: 1,
+              uvCalibrationTargetSource: 'deterministic',
             } satisfies SurfacePickMetadata,
           }
           partMesh.renderOrder = partDomain === 'interior' ? 0 : 1
@@ -1997,12 +1856,20 @@ const PreviewCanvas = memo(function PreviewCanvas({
           geometry.setIndex(resolved.mesh.indices)
         }
 
+        const objectPrimaryUvSetIndex = resolved.meshPartPrimaryUvSetIndices?.[0] ?? 0
+        const objectPrimaryUvs = pickUvSetForShader(
+          resolved.mesh,
+          objectPrimaryUvSetIndex,
+          resolved.meshPartShaderPaths?.[0] ?? resolved.shaderPath,
+        )
         applyMeshUvs(
           geometry,
-          resolved.mesh.uvs,
+          objectPrimaryUvs,
           object.templatePath ? normalizeSwgPath(object.templatePath) : undefined,
           resolved.mesh.hasUvChannel,
-          resolved.shaderPath,
+          resolved.meshPartShaderPaths?.[0] ?? resolved.shaderPath,
+          resolved.meshPartPrimaryScaleU?.[0],
+          resolved.meshPartPrimaryScaleV?.[0],
         )
 
         geometry.computeBoundingBox()
@@ -2023,6 +1890,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
           opacity: 1,
           depthWrite: true,
         })
+        applyShaderRenderSettings(material, resolved.meshPartShaderPaths?.[0] ?? resolved.shaderPath)
         applyTextureToMaterial(
           object.templatePath ? normalizeSwgPath(object.templatePath) : undefined,
           material,
@@ -2045,7 +1913,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
             meshPath: resolved.meshPath,
             appearancePath: resolved.appearancePath,
             shaderPath: resolved.shaderPath,
-            effectPath: resolved.effectPath,
+            effectPath: resolved.meshPartEffectPaths?.[0] ?? resolved.effectPath,
             sourceLabel: resolved.sourceLabel,
             textureLookupKey: object.templatePath ? normalizeSwgPath(object.templatePath) : undefined,
             partIndex: 0,
@@ -2159,9 +2027,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
         // Reset to placeholder first so applyTextureToMaterial can load from cache or re-fetch.
         material.map = placeholder
         material.normalMap = placeholderNormalTexRef.current
-        material.transparent = false
-        material.opacity = 1
-        material.depthWrite = true
+        applyStoredShaderMaterialStateRef.current(material)
         applyTextureToMaterialRef.current(templatePath, material, context)
       }
     }
@@ -2315,8 +2181,6 @@ function App() {
   const [roofCutawayLevel, setRoofCutawayLevel] = useState(0.6)
   const [showPlaceholderObjects, setShowPlaceholderObjects] = useState(false)
   const [renderTextures, setRenderTextures] = useState(false)
-  const [strictDeclaredOnly, setStrictDeclaredOnly] = useState(false)
-  const [preferDecodedOverComposite, setPreferDecodedOverComposite] = useState(false)
 
   const looseFileByPathRef = useRef<Map<string, File>>(new Map())
   const treExtractedByPathRef = useRef<Map<string, RepositorySourceFile>>(new Map())
@@ -2460,30 +2324,38 @@ function App() {
 
   const lookupRepositoryFile = useCallback(async (path: string): Promise<RepositorySourceFile | null> => {
     const normalized = normalizeSwgPath(path)
+    const isTexture = normalized.endsWith('.dds') || normalized.endsWith('.tga')
 
-    const cachedLoose = looseFileByPathRef.current.get(normalized)
-    if (cachedLoose) {
-      return {
-        file: cachedLoose,
-        sourceLabel: 'loose/indexed',
+    // For textures, ONLY use TRE files to ensure exact SWG rendering
+    if (!isTexture) {
+      const cachedLoose = looseFileByPathRef.current.get(normalized)
+      if (cachedLoose) {
+        return {
+          file: cachedLoose,
+          sourceLabel: 'loose/indexed',
+        }
       }
-    }
 
-    const indexed = indexedByPath.get(normalized)
-    if (indexed) {
-      looseFileByPathRef.current.set(normalized, indexed.file)
-      return {
-        file: indexed.file,
-        sourceLabel: 'loose/indexed',
+      const indexed = indexedByPath.get(normalized)
+      if (indexed) {
+        looseFileByPathRef.current.set(normalized, indexed.file)
+        return {
+          file: indexed.file,
+          sourceLabel: 'loose/indexed',
+        }
       }
     }
 
     const cachedTre = treExtractedByPathRef.current.get(normalized)
-    if (cachedTre) return cachedTre
+    if (cachedTre) {
+      if (isTexture) console.log(`[File Lookup] ✓ Found in cached TRE: ${normalized}`)
+      return cachedTre
+    }
 
     const treEntry = resolvedTreByPath.get(normalized)
     let recordHit: TreLookupRecord | null = null
     if (treEntry) {
+      if (isTexture) console.log(`[File Lookup] ✓ Found in resolvedTreByPath: ${normalized}`)
       recordHit = {
         treName: treEntry.treName,
         treFile: treEntry.treFile,
@@ -2492,6 +2364,7 @@ function App() {
     } else {
       const cachedLookup = treLookupByPathRef.current.get(normalized)
       if (cachedLookup) {
+        if (isTexture) console.log(`[File Lookup] ✓ Found in TRE lookup cache: ${normalized}`)
         recordHit = cachedLookup
       } else {
         if (!treLookupBuiltRef.current) {
@@ -2542,8 +2415,12 @@ function App() {
       }
     }
 
-    if (!recordHit) return null
+    if (!recordHit) {
+      if (isTexture) console.error(`[File Lookup] \u2717 NOT FOUND in any source: ${normalized}`)
+      return null
+    }
 
+    if (isTexture) console.log(`[File Lookup] \u2713 Extracting from TRE: ${normalized} (${recordHit.treName})`)
     const file = await extractTreRecord(recordHit.treFile, recordHit.record)
     const source = {
       file,
@@ -2582,8 +2459,8 @@ function App() {
           templatePath === normalizeSwgPath(activeBuilding.rootTemplatePath as string)
         if (existing?.status === 'mesh' && !isRootTemplate) continue
         const visual = await resolveTemplateVisual(templatePath, lookupRepositoryFile, {
-          strictDeclaredOnly,
-          preferDecodedOverComposite,
+          strictDeclaredOnly: true,
+          preferDecodedOverComposite: true,
         })
         updates[templatePath] = visual
       }
@@ -2612,7 +2489,7 @@ function App() {
     return () => {
       canceled = true
     }
-  }, [activeBuilding, lookupRepositoryFile, strictDeclaredOnly, preferDecodedOverComposite])
+  }, [activeBuilding, lookupRepositoryFile])
 
   useEffect(() => {
     const visuals = Object.entries(resolvedVisuals).filter((entry) => {
@@ -2789,6 +2666,9 @@ function App() {
 
         if (existingTexture) {
           URL.revokeObjectURL(existingTexture.url)
+          if (existingTexture.alternateUrl) {
+            URL.revokeObjectURL(existingTexture.alternateUrl)
+          }
           if (existingTexture.normalUrl) {
             URL.revokeObjectURL(existingTexture.normalUrl)
           }
@@ -2802,6 +2682,25 @@ function App() {
         if (!url) {
           url = URL.createObjectURL(hit.file)
           objectUrlsRef.current.set(cacheKey, url)
+        }
+
+        let alternateUrl: string | undefined
+        let resolvedAlternateTexturePath: string | undefined
+        const normalizedResolvedTexturePath = resolvedTexturePath.toLowerCase()
+        for (const altCandidate of texturePathCandidates(texturePath)) {
+          const altNormalized = altCandidate.toLowerCase()
+          if (altNormalized === normalizedResolvedTexturePath) continue
+          const altSource = await resolveTextureSource(altCandidate)
+          if (!altSource) continue
+          if (altSource.resolvedPath.toLowerCase() === normalizedResolvedTexturePath) continue
+          resolvedAlternateTexturePath = altSource.resolvedPath
+          const altCacheKey = `${keyPath}|alt|${resolvedAlternateTexturePath}`
+          alternateUrl = objectUrlsRef.current.get(altCacheKey)
+          if (!alternateUrl) {
+            alternateUrl = URL.createObjectURL(altSource.source.file)
+            objectUrlsRef.current.set(altCacheKey, alternateUrl)
+          }
+          break
         }
 
         let normalUrl: string | undefined
@@ -2839,6 +2738,8 @@ function App() {
         next[keyPath] = {
           url,
           texturePath: resolvedTexturePath,
+          alternateUrl,
+          alternateTexturePath: alternateUrl ? resolvedAlternateTexturePath : undefined,
           textureAddressU,
           textureAddressV,
           textureMipmapFilter,
@@ -3864,52 +3765,6 @@ function App() {
                   type="checkbox"
                   checked={showPlaceholderObjects}
                   onChange={(event) => setShowPlaceholderObjects(event.target.checked)}
-                />
-              </label>
-              <label className="toggle-row">
-                <span>Strict declared-only resolver</span>
-                <input
-                  id="strict-declared-only-toggle"
-                  name="strict-declared-only-toggle"
-                  type="checkbox"
-                  checked={strictDeclaredOnly}
-                  onChange={(event) => {
-                    const next = event.target.checked
-                    setStrictDeclaredOnly(next)
-                    clearPreviewResolverCaches()
-                    setResolvedVisuals({})
-                    setResolvedTextures({})
-                    objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
-                    objectUrlsRef.current.clear()
-                    appendLog(
-                      next
-                        ? 'Strict resolver enabled: only declared shader/effect refs will be used.'
-                        : 'Strict resolver disabled: fallback resolution paths restored.',
-                    )
-                  }}
-                />
-              </label>
-              <label className="toggle-row">
-                <span>Prefer decoded mesh (can hide exterior shell)</span>
-                <input
-                  id="prefer-decoded-over-composite-toggle"
-                  name="prefer-decoded-over-composite-toggle"
-                  type="checkbox"
-                  checked={preferDecodedOverComposite}
-                  onChange={(event) => {
-                    const next = event.target.checked
-                    setPreferDecodedOverComposite(next)
-                    clearPreviewResolverCaches()
-                    setResolvedVisuals({})
-                    setResolvedTextures({})
-                    objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
-                    objectUrlsRef.current.clear()
-                    appendLog(
-                      next
-                        ? 'Decoded-first mesh mode enabled: composites are fallback only.'
-                        : 'Composite-first mesh mode enabled: restored default root selection order.',
-                    )
-                  }}
                 />
               </label>
             </section>
