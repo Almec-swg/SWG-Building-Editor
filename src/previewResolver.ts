@@ -139,6 +139,8 @@ const shaderStageRefsCache = new Map<string, {
   alphaReference: number
   transparent: boolean
   alphaBlend: boolean
+  selfIllum: boolean
+  lavaEffect: boolean
   effectTags: string[]
   shaderDebugChunks?: string[]
 }>()
@@ -214,6 +216,8 @@ export function getShaderRenderProps(shaderPath: string): {
   alphaReference: number
   transparent: boolean
   alphaBlend: boolean
+  selfIllum: boolean
+  lavaEffect: boolean
   effectTags: string[]
 } | undefined {
   const normalized = normalizeSwgPath(shaderPath)
@@ -224,6 +228,8 @@ export function getShaderRenderProps(shaderPath: string): {
     alphaReference: cached.alphaReference,
     transparent: cached.transparent,
     alphaBlend: cached.alphaBlend,
+    selfIllum: cached.selfIllum,
+    lavaEffect: cached.lavaEffect,
     effectTags: [...cached.effectTags],
   }
 }
@@ -274,11 +280,41 @@ function extensionDirectories(fileExt: string): string[] {
   return []
 }
 
+// Known SWG asset subdirectories that may appear as a leading segment on a
+// "relative" ref inside a nested LOD/CMP/APT chain. When a ref begins with one
+// of these, it is anchored to a parent of the referencing file's directory
+// (e.g. an LOD at `appearance/lod/foo.lod` referencing `component/bar.cmp`
+// resolves to `appearance/component/bar.cmp`, not `appearance/lod/component/...`).
+const SWG_KNOWN_SUBDIRS = [
+  'appearance',
+  'mesh',
+  'lod',
+  'component',
+  'collision',
+  'texture',
+  'shader',
+  'effect',
+  'object',
+  'animation',
+  'skeletal_mesh',
+  'skeletal_animation',
+  'skeleton',
+  'palette',
+  'sound',
+  'string',
+  'datatables',
+] as const
+
+function refHasKnownSubdirPrefix(clean: string): boolean {
+  const slash = clean.indexOf('/')
+  if (slash <= 0) return false
+  const first = clean.slice(0, slash)
+  return (SWG_KNOWN_SUBDIRS as readonly string[]).includes(first)
+}
+
 function resolveRefCandidates(basePath: string, ref: string): string[] {
   const clean = normalizeSwgPath(ref)
-  // SWG uses exact paths as they appear in the data files.
-  // If the reference contains a directory separator, use it exactly.
-  if (clean.includes('/')) return [clean]
+  if (!clean) return []
 
   const results: string[] = []
   const seen = new Set<string>()
@@ -289,6 +325,36 @@ function resolveRefCandidates(basePath: string, ref: string): string[] {
     results.push(normalized)
   }
 
+  // Path 1: ref already contains a directory separator.
+  if (clean.includes('/')) {
+    // Priority 1a: the literal path as-written. This preserves current behavior
+    // for refs that are absolute (`appearance/...`, `texture/...`, etc.).
+    push(clean)
+
+    // Priority 1b: if the ref starts with a known SWG subdir but the base is
+    // anchored deeper (e.g. base `appearance/lod/x.lod`, ref `component/y.cmp`),
+    // try anchoring the ref under each ancestor directory of the base path.
+    // This handles nested LOD/CMP/APT chains whose refs are relative to the
+    // appearance subtree rather than to the immediate file directory.
+    if (refHasKnownSubdirPrefix(clean) && !clean.startsWith('appearance/')) {
+      const base = normalizeSwgPath(basePath)
+      const segments = base.split('/').filter(Boolean)
+      // Drop the filename segment.
+      if (segments.length > 0) segments.pop()
+      // Walk from deepest parent up to root, trying each as an anchor.
+      for (let i = segments.length - 1; i >= 0; i--) {
+        const anchor = segments.slice(0, i).join('/')
+        push(anchor ? `${anchor}/${clean}` : clean)
+      }
+      // Finally, try anchoring under `appearance/` explicitly (covers refs
+      // that are relative to the appearance root even when the base is not).
+      push(`appearance/${clean}`)
+    }
+
+    return results
+  }
+
+  // Path 2: bare filename, no directory separator.
   // Priority 1: Relative to the referencing file's directory (same directory as shader/mesh)
   const dir = dirname(normalizeSwgPath(basePath))
   if (dir) push(`${dir}/${clean}`)
@@ -2519,6 +2585,8 @@ function extractShaderStageTextureRefs(
   alphaReference: number
   transparent: boolean
   alphaBlend: boolean
+  selfIllum: boolean
+  lavaEffect: boolean
   effectTags: string[]
   shaderDebugChunks?: string[]  // For debugging
 } {
@@ -2545,6 +2613,8 @@ function extractShaderStageTextureRefs(
     alphaReference: 0,
     transparent: false,
     alphaBlend: false,
+    selfIllum: false,
+    lavaEffect: false,
     effectTags: [] as string[],
   }
   if (!root) return empty
@@ -2639,6 +2709,8 @@ function extractShaderStageTextureRefs(
   let alphaReference = 0
   let transparent = false
   let alphaBlend = false
+  let selfIllum = false
+  let lavaEffect = false
   const effectTags: string[] = []
   const shaderDebugChunks: string[] = []  // Capture all chunks for debugging
   
@@ -2728,6 +2800,21 @@ function extractShaderStageTextureRefs(
         ) {
           transparent = true
           alphaBlend = true
+        }
+        // Self-illuminated / emissive effect families. The actual pixel
+        // shaders for these (a_lava_*, a_emis_*, a_glow_*) bypass scene
+        // lighting and either sample a colorramp by heat or just blast the
+        // diffuse texture as emission. We approximate by flagging the
+        // material so the renderer can set emissive + emissiveMap.
+        if (
+          lower.includes('a_lava') ||
+          lower.includes('a_emis') ||
+          lower.includes('a_glow')
+        ) {
+          selfIllum = true
+        }
+        if (lower.includes('a_lava')) {
+          lavaEffect = true
         }
       }
     }
@@ -3119,6 +3206,8 @@ function extractShaderStageTextureRefs(
     alphaReference,
     transparent,
     alphaBlend,
+    selfIllum,
+    lavaEffect,
     effectTags,
     shaderDebugChunks,
   }
@@ -3967,7 +4056,7 @@ function extractDtlLastChildRef(buffer: ArrayBuffer, basePath: string): string |
 
     if (!meshRef) {
       const ascii = extractAsciiStrings(
-        payload.buffer.slice(payload.byteOffset, payload.byteLength),
+        payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
         4,
       )
       const fallback = ascii.find((value) => /\.(?:apt|msh|lod|cmp|pob)$/i.test(value))
@@ -4564,7 +4653,33 @@ function buildLodSiblingMeshCandidates(lodPath: string): string[] {
   return out
 }
 
-function extractLodMeshRefs(buffer: ArrayBuffer, basePath?: string): string[] {
+function buildLodSiblingRefCandidates(lodPath: string): string[] {
+  const normalized = normalizeSwgPath(lodPath)
+  if (!normalized.endsWith('.lod')) return []
+
+  const stem = normalized.slice(0, -4)
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (value: string) => {
+    const next = normalizeSwgPath(value)
+    const nextExt = ext(next)
+    if (!['.msh', '.lod', '.cmp', '.apt', '.pob'].includes(nextExt) || seen.has(next)) return
+    seen.add(next)
+    out.push(next)
+  }
+
+  push(`${stem}_l0.cmp`)
+  push(`${stem}_l0.lod`)
+  for (let component = 0; component <= 9; component += 1) {
+    push(`${stem}_l0_c${component}.lod`)
+    push(`${stem}_l0_c${component}.cmp`)
+  }
+  for (const mesh of buildLodSiblingMeshCandidates(lodPath)) push(mesh)
+
+  return out
+}
+
+function extractLodResolvedRefs(buffer: ArrayBuffer, basePath?: string): string[] {
   const refs = new Set<string>()
   const bytes = new Uint8Array(buffer)
   const base = basePath ? normalizeSwgPath(basePath) : ''
@@ -4574,7 +4689,7 @@ function extractLodMeshRefs(buffer: ArrayBuffer, basePath?: string): string[] {
     if (!trimmed) return
     const resolved = resolveRefCandidates(base, trimmed)
     for (const candidate of resolved) {
-      if (ext(candidate) === '.msh') refs.add(candidate)
+      if (['.msh', '.lod', '.cmp', '.apt', '.pob'].includes(ext(candidate))) refs.add(candidate)
     }
   }
 
@@ -4599,7 +4714,7 @@ function extractLodMeshRefs(buffer: ArrayBuffer, basePath?: string): string[] {
         6,
       )
       for (const text of ascii) {
-        if (/\.(?:msh)$/i.test(text)) addRef(text)
+        if (/\.(?:msh|lod|cmp|apt|pob)$/i.test(text)) addRef(text)
       }
     }
   } catch {
@@ -4609,13 +4724,23 @@ function extractLodMeshRefs(buffer: ArrayBuffer, basePath?: string): string[] {
   if (refs.size === 0) {
     const decoder = new TextDecoder('utf-8', { fatal: false })
     const fullText = decoder.decode(bytes)
-    const meshMatches = fullText.match(/[a-z0-9_./\\-]+\.msh/gi)
-    if (meshMatches) {
-      for (const match of meshMatches) addRef(match)
+    const refMatches = fullText.match(/[a-z0-9_./\\-]+\.(?:msh|lod|cmp|apt|pob)/gi)
+    if (refMatches) {
+      for (const match of refMatches) addRef(match)
     }
   }
 
   return Array.from(refs)
+}
+
+function getDeterministicLodRefCandidates(buffer: ArrayBuffer, lodPath: string): string[] {
+  const explicitRefs = extractLodResolvedRefs(buffer, lodPath)
+  if (explicitRefs.length > 0) return explicitRefs
+  // Some SWG LOD variants do not expose mesh refs in NAME chunks the way our
+  // parser expects. Fall back to stable sibling-name synthesis only when the
+  // explicit parse yields nothing so deterministic mode stays authoritative
+  // where the file content is clear.
+  return buildLodSiblingRefCandidates(lodPath)
 }
 
 
@@ -4624,6 +4749,34 @@ function parseTrailingLevel(path: string): number {
   const match = lower.match(/_l(\d+)\.msh$/)
   if (!match) return Number.POSITIVE_INFINITY
   return Number.parseInt(match[1], 10)
+}
+
+// Group mesh refs by their "shape signature" (path with every `_l\d+` segment
+// stripped out) and pick the highest-detail variant per group — i.e. the one
+// whose summed LOD-level digits is smallest. This handles SWG LOD chains where
+// a single component is referenced at multiple detail levels (e.g.
+// `_l0_c0_l0_c0.msh` / `_l0_c0_l1_c0.msh` / ...) and would otherwise be
+// combined as duplicates at the same origin (causing "spiked" overlap) or
+// picked one-at-a-time (causing missing geometry).
+function pickHighestDetailLodMeshes(paths: string[]): string[] {
+  const seen = new Map<string, { path: string; score: number }>()
+  for (const raw of paths) {
+    const next = normalizeSwgPath(raw)
+    if (ext(next) !== '.msh') continue
+    const levels = Array.from(next.matchAll(/_l(\d+)(?=[_./])/g)).map((m) => Number(m[1]))
+    if (levels.length === 0) {
+      // No LOD segments — keep as-is, grouped by full path (effectively unique).
+      if (!seen.has(next)) seen.set(next, { path: next, score: 0 })
+      continue
+    }
+    const groupKey = next.replace(/_l\d+(?=[_./])/g, '_l#')
+    const score = levels.reduce((acc, v) => acc + v, 0)
+    const existing = seen.get(groupKey)
+    if (!existing || score < existing.score || (score === existing.score && next < existing.path)) {
+      seen.set(groupKey, { path: next, score })
+    }
+  }
+  return Array.from(seen.values()).map((entry) => entry.path)
 }
 
 function chooseBestByLowestLevel(paths: string[]): string[] {
@@ -4654,13 +4807,14 @@ function choosePreferredSieMeshRefs(meshRefs: string[]): string[] {
   )
   if (normalized.length === 0) return []
 
-  const componentRefs = normalized.filter((value) => /_c\d+_l\d+\.msh$/.test(value))
-  if (componentRefs.length > 0) {
-    const pickedComponent = chooseBestByLowestLevel(componentRefs)
-    // SIE-style componentized assets should resolve from component families,
-    // not unrelated fallback meshes.
-    return Array.from(new Set(pickedComponent))
-  }
+  // Group by full LOD-stripped signature so multiple detail levels of the
+  // same component (e.g. `..._l0_c0_l0_c0.msh` / `..._l0_c0_l3_c0.msh`)
+  // collapse to a single highest-detail pick, while distinct components
+  // (`_c0` walls vs `_c1` pillars) remain separate parts. Without this both
+  // (a) the `c0` walls are filtered out by an over-strict trailing-`_l#`
+  // regex, and (b) the same component's LOD copies pile up at one origin.
+  const collapsed = pickHighestDetailLodMeshes(normalized)
+  if (collapsed.length > 0) return collapsed
 
   return chooseBestByLowestLevel(normalized)
 }
@@ -4707,7 +4861,7 @@ function extractCmpPartEntries(buffer: ArrayBuffer, basePath: string): CmpPartEn
 
     if (!meshRef) {
       const ascii = extractAsciiStrings(
-        payload.buffer.slice(payload.byteOffset, payload.byteLength),
+        payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
         4,
       )
       const fallback = ascii.find((value) => /\.(?:apt|msh|lod|cmp|pob)$/i.test(value))
@@ -4925,12 +5079,12 @@ async function collectSieChainMeshRefs(
 
     if (nextExt === '.lod') {
       // Parse LOD file to extract actual mesh references
-      const lodRefs = extractLodMeshRefs(buffer, next.path)
+      const lodRefs = getDeterministicLodRefCandidates(buffer, next.path)
       for (const lodRef of lodRefs) {
         refs.push(lodRef)
       }
       // Also try filename-based guessing as fallback
-      for (const sibling of buildLodSiblingMeshCandidates(next.path)) {
+      for (const sibling of buildLodSiblingRefCandidates(next.path)) {
         refs.push(sibling)
       }
     }
@@ -4998,8 +5152,10 @@ async function collectDeclaredMeshRefs(
     }
 
     if (nextExt === '.lod') {
-      // Deterministic: only explicit NAME references extracted from LOD content.
-      const lodRefs = extractLodMeshRefs(buffer, next.path)
+      // Deterministic: prefer explicit LOD mesh refs, but if the file encodes
+      // them in an unsupported variant, use a stable sibling-name fallback
+      // instead of dropping the exterior entirely.
+      const lodRefs = getDeterministicLodRefCandidates(buffer, next.path)
       for (const lodRef of lodRefs) refs.push(lodRef)
     }
 
@@ -5317,23 +5473,22 @@ async function resolveBestDecodedMesh(
     }
 
     if (candidateExt === '.lod') {
-      // Parse LOD file to extract actual mesh references
-      const lodRefs = extractLodMeshRefs(buffer, candidate)
-      // Deterministic: include all explicit refs discoverable from the LOD file payload.
-      const genericRefs = Array.from(
-        new Set(getResolvedRefCandidatesCached(candidate, buffer)),
-      ).filter((value) => ext(value) === '.msh')
-      for (const ref of genericRefs) {
-        if (!lodRefs.includes(ref)) lodRefs.push(ref)
-      }
+      // Deterministic LOD handling should walk the declared child chain
+      // (nested LOD/CMP/APT/POB) until it reaches concrete mesh leaves.
+      const lodRefsAll = await collectDeclaredMeshRefs([candidate], lookup, 4)
 
       if (!deterministicOrder) {
-        // Fallback to filename-based guessing
+        // Non-deterministic mode can broaden further with extra filename-based guesses.
         const synthesizedRefs = buildLodSiblingMeshCandidates(candidate)
         for (const sibling of synthesizedRefs) {
-          if (!lodRefs.includes(sibling)) lodRefs.push(sibling)
+          if (!lodRefsAll.includes(sibling)) lodRefsAll.push(sibling)
         }
       }
+
+      // Per LOD chain, collapse multiple detail levels of the same component
+      // into a single highest-detail pick so the combine step assembles real
+      // shell parts rather than overlaying duplicate LOD copies.
+      const lodRefs = pickHighestDetailLodMeshes(lodRefsAll)
 
       const lodPartMeshes: PreviewMeshData[] = []
 
@@ -5367,7 +5522,7 @@ async function resolveBestDecodedMesh(
       }
 
       // Deterministic mode: never decode raw .lod payload as geometry.
-      // LOD must resolve through explicit mesh references only.
+      // LOD must resolve through referenced mesh paths only.
       continue
     }
 

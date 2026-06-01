@@ -1306,6 +1306,11 @@ const PreviewCanvas = memo(function PreviewCanvas({
       const cached = textureCacheRef.current.get(key)
       if (cached && isTextureRenderable(cached)) {
         material.map = cached
+        if (material.userData?.shaderSelfIllum) {
+          material.emissiveMap = cached
+          material.emissive.setRGB(1, 1, 1)
+          material.emissiveIntensity = 1
+        }
 
         const normalKey = textureMeta.normalUrl
         if (normalKey) {
@@ -1422,6 +1427,11 @@ const PreviewCanvas = memo(function PreviewCanvas({
 
             cacheTexture(key, texture)
           material.map = texture
+          if (material.userData?.shaderSelfIllum) {
+            material.emissiveMap = texture
+            material.emissive.setRGB(1, 1, 1)
+            material.emissiveIntensity = 1
+          }
           material.needsUpdate = true
           console.log(`[Texture Apply] Applied color texture to material: ${textureMeta.texturePath}`)
 
@@ -1615,14 +1625,73 @@ const PreviewCanvas = memo(function PreviewCanvas({
         material.blending = THREE.NormalBlending
       }
 
+      if (props.selfIllum) {
+        material.emissive.setRGB(1, 1, 1)
+        material.emissiveIntensity = 1
+        if (material.map) {
+          material.emissiveMap = material.map
+        }
+      } else {
+        material.emissive.setRGB(0, 0, 0)
+        material.emissiveMap = null
+      }
+
+      if (props.lavaEffect) {
+        applyLavaShaderInjection(material)
+      } else if (material.userData?.shaderLavaInjected) {
+        // Material was previously lava but isn't anymore; drop the onBeforeCompile.
+        material.onBeforeCompile = () => {}
+        material.customProgramCacheKey = () => 'default'
+        material.userData.shaderLavaInjected = false
+        material.needsUpdate = true
+      }
+
       material.userData = {
         ...material.userData,
         shaderAlphaTest: props.alphaTest,
         shaderAlphaReference: props.alphaReference,
         shaderTransparent: props.transparent,
         shaderAlphaBlend: props.alphaBlend,
+        shaderSelfIllum: props.selfIllum,
+        shaderLavaEffect: props.lavaEffect,
         shaderEffectTags: props.effectTags,
       }
+    }
+
+    function applyLavaShaderInjection(material: THREE.MeshPhongMaterial): void {
+      if (material.userData?.shaderLavaInjected) return
+      material.onBeforeCompile = (shader) => {
+        shader.fragmentShader = shader.fragmentShader.replace(
+          '#include <map_fragment>',
+          [
+            '#ifdef USE_MAP',
+            '  vec4 sampledDiffuseColor = texture2D( map, vMapUv );',
+            // Render lava unlit — zero out diffuse so only the emissive ramp shows.
+            '  diffuseColor = vec4( 0.0, 0.0, 0.0, sampledDiffuseColor.a );',
+            '#endif',
+          ].join('\n'),
+        )
+        shader.fragmentShader = shader.fragmentShader.replace(
+          '#include <emissivemap_fragment>',
+          [
+            '#ifdef USE_EMISSIVEMAP',
+            '  vec4 heatSample = texture2D( emissiveMap, vEmissiveMapUv );',
+            // Use red channel as heat; modulate slightly by green so detail in the',
+            // texture creates color variation across the surface.',
+            '  float heat = clamp( heatSample.r * 0.75 + heatSample.g * 0.35, 0.0, 1.0 );',
+            '  vec3 lavaCool = vec3( 0.08, 0.005, 0.0 );',
+            '  vec3 lavaMid  = vec3( 0.95, 0.18, 0.02 );',
+            '  vec3 lavaHot  = vec3( 1.00, 0.85, 0.30 );',
+            '  vec3 ramp = mix( lavaCool, lavaMid, smoothstep( 0.05, 0.55, heat ) );',
+            '  ramp = mix( ramp, lavaHot, smoothstep( 0.55, 0.95, heat ) );',
+            '  totalEmissiveRadiance = ramp;',
+            '#endif',
+          ].join('\n'),
+        )
+      }
+      material.customProgramCacheKey = () => 'swg-lava-v1'
+      material.userData.shaderLavaInjected = true
+      material.needsUpdate = true
     }
 
     function applyStoredShaderMaterialState(material: THREE.MeshPhongMaterial): void {
@@ -1645,6 +1714,19 @@ const PreviewCanvas = memo(function PreviewCanvas({
       material.blending = hasAdditive ? THREE.AdditiveBlending : THREE.NormalBlending
       material.depthWrite = !(material.transparent)
       material.opacity = 1
+      if (material.userData?.shaderSelfIllum) {
+        material.emissive.setRGB(1, 1, 1)
+        material.emissiveIntensity = 1
+        if (material.map) {
+          material.emissiveMap = material.map
+        }
+      } else {
+        material.emissive.setRGB(0, 0, 0)
+        material.emissiveMap = null
+      }
+      if (material.userData?.shaderLavaEffect && !material.userData?.shaderLavaInjected) {
+        applyLavaShaderInjection(material)
+      }
     }
 
     const footprintGeometry = new THREE.BoxGeometry(building.width, 0.28, building.depth)
