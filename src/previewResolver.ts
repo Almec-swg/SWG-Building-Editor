@@ -2699,14 +2699,11 @@ function extractShaderStageTextureRefs(
   const visit = (node: BinaryChunk) => {
     if (node.tag === 'FORM' && node.type) {
       formChunks.add(node.type)
-      // ARVS = Alpha Reference Value Source. SHT files only include this FORM
-      // when the shader expects alpha blending against an existing surface
-      // (e.g. grunge overlays, glass, decals). Its presence is a definitive
-      // signal even if no textual TAG chunk is emitted.
-      if (node.type === 'ARVS') {
-        transparent = true
-        alphaBlend = true
-      }
+      // NOTE: ARVS (Alpha Reference Value Source) is NOT a reliable alpha-blend
+      // signal on its own. Envmask/spec shaders (e.g. a_envmask_specmap.eft)
+      // include ARVS to point at the spec map's alpha channel for env masking,
+      // even though the rendered material is opaque. Rely on the effect-name
+      // family below for the actual transparency decision.
     }
 
     // SHT references its effect via a NAME chunk at the top level. Effect
