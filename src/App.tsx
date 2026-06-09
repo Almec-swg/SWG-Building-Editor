@@ -13,6 +13,7 @@ import {
   type ResolvedTemplateVisual,
   extractMeshFromAsset,
   getShaderDebugChunks,
+  getEffectDebugChunks,
   getShaderRenderProps,
 } from './previewResolver'
 import { extractTreRecord, parseTreArchive, type TreCompression, type TreRecordMeta } from './treParser'
@@ -86,6 +87,8 @@ type ResolvedVisualMap = Record<string, ResolvedTemplateVisual | undefined>
 type ResolvedTextureMap = Record<string, {
   url: string
   texturePath: string
+  alternateUrl?: string
+  alternateTexturePath?: string
   textureAddressU?: 'wrap' | 'mirror' | 'clamp' | 'border' | 'mirroronce'
   textureAddressV?: 'wrap' | 'mirror' | 'clamp' | 'border' | 'mirroronce'
   textureMipmapFilter?: 'none' | 'point' | 'linear' | 'anisotropic' | 'flatcubic' | 'gaussiancubic'
@@ -130,10 +133,13 @@ interface SurfacePickMetadata {
   detailAddressV?: string
   chunkTrace?: string
   shaderDebugChunks?: string[]  // Shader IFF structure for debugging
+  effectDebugChunks?: string[]   // Effect (.eft) IFF structure for debugging
   uvCalibrationTransform?: string
   uvCalibrationScaleU?: number
   uvCalibrationScaleV?: number
   uvCalibrationTargetSource?: string
+  /** HPNT (hardpoint) anchors discovered along the resolved appearance chain. */
+  hardpoints?: { name: string; matrix: number[]; sourcePath?: string }[]
 }
 
 function buildPartTextureKey(templatePath: string, partIndex: number): string {
@@ -378,6 +384,9 @@ const PreviewCanvas = memo(function PreviewCanvas({
     material: THREE.MeshPhongMaterial,
     context: 'object' | 'root',
   ) => void>(() => {})
+  const applyStoredShaderMaterialStateRef = useRef<(
+    material: THREE.MeshPhongMaterial,
+  ) => void>(() => {})
   const allMaterialsRef = useRef<Array<{
     material: THREE.MeshPhongMaterial
     templatePath: string | undefined
@@ -562,6 +571,43 @@ const PreviewCanvas = memo(function PreviewCanvas({
       `uvCalibrationTransform: ${meta.uvCalibrationTransform ?? 'n/a'}`,
       `uvCalibrationScale: [${meta.uvCalibrationScaleU?.toFixed(6) ?? 'n/a'}, ${meta.uvCalibrationScaleV?.toFixed(6) ?? 'n/a'}]`,
       `uvCalibrationTargetSource: ${meta.uvCalibrationTargetSource ?? 'n/a'}`,
+      (() => {
+        // Dump every vertex (position + every available UV channel) and every triangle's indices
+        // so we can see whether our decoded UVs match what the mesh actually authored.
+        if (!positionAttr) return '\n--- Full Mesh Part Dump ---\nno position attribute'
+        const lines: string[] = ['', '--- Full Mesh Part Dump ---']
+        const channelNames = ['uv', 'uv1', 'uv2', 'uv3', 'uv4', 'uv5', 'uv6', 'uv7']
+        const channels: Array<{ name: string; attr: THREE.BufferAttribute }> = []
+        for (const name of channelNames) {
+          const a = geometry?.getAttribute(name) as THREE.BufferAttribute | undefined
+          if (a && a.itemSize >= 2 && a.count > 0) channels.push({ name, attr: a })
+        }
+        lines.push(`channels: position(itemSize=${positionAttr.itemSize}, count=${positionAttr.count}) ${channels.map((c) => `${c.name}(itemSize=${c.attr.itemSize}, count=${c.attr.count})`).join(' | ')}`)
+        const vertCount = positionAttr.count
+        for (let i = 0; i < vertCount; i++) {
+          const x = positionAttr.getX(i).toFixed(3)
+          const y = positionAttr.getY(i).toFixed(3)
+          const z = positionAttr.getZ(i).toFixed(3)
+          const uvs = channels.map((c) => `${c.name}=(${c.attr.getX(i).toFixed(4)},${c.attr.getY(i).toFixed(4)})`).join(' ')
+          lines.push(`  vtx[${i}] pos=(${x},${y},${z}) ${uvs}`)
+        }
+        const idx = geometry?.index
+        if (idx) {
+          const triCount2 = Math.floor(idx.count / 3)
+          for (let t = 0; t < triCount2; t++) {
+            lines.push(`  tri[${t}] = (${idx.getX(t * 3)}, ${idx.getX(t * 3 + 1)}, ${idx.getX(t * 3 + 2)})`)
+          }
+        } else {
+          lines.push('  (no index buffer)')
+        }
+        const dd = (geometry?.userData as any)?.decodeDebug
+        if (typeof dd === 'string' && dd.length > 0) {
+          lines.push('')
+          lines.push('--- MSH Decoder Debug ---')
+          lines.push(dd)
+        }
+        return lines.join('\n')
+      })(),
       '',
       '--- UV Application Debug ---',
       `uvDebug.called: ${(geometry?.userData?.uvDebug as any)?.called ?? false}`,
@@ -589,6 +635,32 @@ const PreviewCanvas = memo(function PreviewCanvas({
               '',
             ]
           : []),
+      ...((() => {
+        const effectChunks = meta.effectPath ? getEffectDebugChunks(meta.effectPath) : undefined
+        if (!effectChunks || effectChunks.length === 0) return []
+        return [
+          `--- Effect IFF Structure (${meta.effectPath}) ---`,
+          ...effectChunks,
+          '',
+        ]
+      })()),
+      ...((meta.hardpoints && meta.hardpoints.length > 0)
+        ? [
+            `--- Hardpoints (${meta.hardpoints.length}) ---`,
+            ...meta.hardpoints.map((hp) => {
+              const m = hp.matrix
+              const tx = m[3].toFixed(3)
+              const ty = m[7].toFixed(3)
+              const tz = m[11].toFixed(3)
+              const r0 = `${m[0].toFixed(3)},${m[1].toFixed(3)},${m[2].toFixed(3)}`
+              const r1 = `${m[4].toFixed(3)},${m[5].toFixed(3)},${m[6].toFixed(3)}`
+              const r2 = `${m[8].toFixed(3)},${m[9].toFixed(3)},${m[10].toFixed(3)}`
+              const src = hp.sourcePath ? ` @ ${hp.sourcePath}` : ''
+              return `  ${hp.name}: t=(${tx}, ${ty}, ${tz}) R=[${r0} | ${r1} | ${r2}]${src}`
+            }),
+            '',
+          ]
+        : []),
       `nearOverlapHitCount: ${overlapHits.length}`,
       ...overlapLines,
       '',
@@ -980,6 +1052,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
     // Expose the current applyTextureToMaterial closure so the renderTextures toggle
     // effect can reapply textures without triggering a full rebuild.
     applyTextureToMaterialRef.current = applyTextureToMaterial
+    applyStoredShaderMaterialStateRef.current = applyStoredShaderMaterialState
 
     const isMaterialUsable = (material: THREE.Material): boolean => {
       if (previewBuildEpochRef.current !== buildEpoch) return false
@@ -1197,9 +1270,47 @@ const PreviewCanvas = memo(function PreviewCanvas({
       }
 
       const key = textureMeta.url
+      if (_attempted.has(key)) return
+
+      const findAlternateTextureMeta = (): ResolvedTextureMap[string] | undefined => {
+        if (!textureMeta?.texturePath) return undefined
+        if (textureMeta.alternateUrl && textureMeta.alternateTexturePath && textureMeta.alternateUrl !== key) {
+          return {
+            ...textureMeta,
+            url: textureMeta.alternateUrl,
+            texturePath: textureMeta.alternateTexturePath,
+            alternateUrl: key,
+            alternateTexturePath: textureMeta.texturePath,
+          }
+        }
+
+        const currentPath = textureMeta.texturePath.toLowerCase()
+        const alternates = altTextureCandidates(currentPath).filter((value) => value !== currentPath)
+        if (alternates.length === 0) return undefined
+
+        const allEntries = Object.values(resolvedTextures)
+        for (const altPath of alternates) {
+          const direct = allEntries.find((entry) => entry?.texturePath?.toLowerCase() === altPath)
+          if (direct && direct.url !== key) return direct
+        }
+
+        // Fallback by filename if path prefix differs but basename matches.
+        const altFiles = new Set(alternates.map((value) => value.split('/').pop() ?? value))
+        return allEntries.find((entry) => {
+          if (!entry?.texturePath || entry.url === key) return false
+          const file = entry.texturePath.toLowerCase().split('/').pop() ?? entry.texturePath.toLowerCase()
+          return altFiles.has(file)
+        })
+      }
+
       const cached = textureCacheRef.current.get(key)
       if (cached && isTextureRenderable(cached)) {
         material.map = cached
+        if (material.userData?.shaderSelfIllum) {
+          material.emissiveMap = cached
+          material.emissive.setRGB(1, 1, 1)
+          material.emissiveIntensity = 1
+        }
 
         const normalKey = textureMeta.normalUrl
         if (normalKey) {
@@ -1316,6 +1427,11 @@ const PreviewCanvas = memo(function PreviewCanvas({
 
             cacheTexture(key, texture)
           material.map = texture
+          if (material.userData?.shaderSelfIllum) {
+            material.emissiveMap = texture
+            material.emissive.setRGB(1, 1, 1)
+            material.emissiveIntensity = 1
+          }
           material.needsUpdate = true
           console.log(`[Texture Apply] Applied color texture to material: ${textureMeta.texturePath}`)
 
@@ -1444,6 +1560,22 @@ const PreviewCanvas = memo(function PreviewCanvas({
         undefined,
         () => {
           pendingTextureLoads.delete(key)
+
+          const alternate = findAlternateTextureMeta()
+          if (alternate && templatePath) {
+            resolvedTextureAliasRef.current.set(templatePath, alternate)
+            const nextAttempted = new Set(_attempted)
+            nextAttempted.add(key)
+            console.warn('[Texture] Primary texture load failed, retrying alternate extension', {
+              templatePath,
+              failedTexturePath: textureMeta.texturePath,
+              alternateTexturePath: alternate.texturePath,
+              context,
+            })
+            applyTextureToMaterial(templatePath, material, context, nextAttempted)
+            return
+          }
+
           if (!rejectedTexturePathsRef.current.has(textureMeta.texturePath)) {
             rejectedTexturePathsRef.current.add(textureMeta.texturePath)
             console.error(`[Texture Load] \u2717 Failed to load texture for ${templatePath}:`)
@@ -1479,6 +1611,39 @@ const PreviewCanvas = memo(function PreviewCanvas({
 
       if (props.transparent || props.alphaBlend) {
         material.transparent = true
+        material.depthWrite = false
+      } else {
+        material.depthWrite = true
+      }
+
+      const hasAdditive = props.effectTags.some((tag) => tag === 'ADDT' || tag === 'ADDITIVE' || tag === 'ADD')
+      if (hasAdditive) {
+        material.blending = THREE.AdditiveBlending
+        material.transparent = true
+        material.depthWrite = false
+      } else {
+        material.blending = THREE.NormalBlending
+      }
+
+      if (props.selfIllum) {
+        material.emissive.setRGB(1, 1, 1)
+        material.emissiveIntensity = 1
+        if (material.map) {
+          material.emissiveMap = material.map
+        }
+      } else {
+        material.emissive.setRGB(0, 0, 0)
+        material.emissiveMap = null
+      }
+
+      if (props.lavaEffect) {
+        applyLavaShaderInjection(material)
+      } else if (material.userData?.shaderLavaInjected) {
+        // Material was previously lava but isn't anymore; drop the onBeforeCompile.
+        material.onBeforeCompile = () => {}
+        material.customProgramCacheKey = () => 'default'
+        material.userData.shaderLavaInjected = false
+        material.needsUpdate = true
       }
 
       material.userData = {
@@ -1487,7 +1652,80 @@ const PreviewCanvas = memo(function PreviewCanvas({
         shaderAlphaReference: props.alphaReference,
         shaderTransparent: props.transparent,
         shaderAlphaBlend: props.alphaBlend,
+        shaderSelfIllum: props.selfIllum,
+        shaderLavaEffect: props.lavaEffect,
         shaderEffectTags: props.effectTags,
+      }
+    }
+
+    function applyLavaShaderInjection(material: THREE.MeshPhongMaterial): void {
+      if (material.userData?.shaderLavaInjected) return
+      material.onBeforeCompile = (shader) => {
+        shader.fragmentShader = shader.fragmentShader.replace(
+          '#include <map_fragment>',
+          [
+            '#ifdef USE_MAP',
+            '  vec4 sampledDiffuseColor = texture2D( map, vMapUv );',
+            // Render lava unlit — zero out diffuse so only the emissive ramp shows.
+            '  diffuseColor = vec4( 0.0, 0.0, 0.0, sampledDiffuseColor.a );',
+            '#endif',
+          ].join('\n'),
+        )
+        shader.fragmentShader = shader.fragmentShader.replace(
+          '#include <emissivemap_fragment>',
+          [
+            '#ifdef USE_EMISSIVEMAP',
+            '  vec4 heatSample = texture2D( emissiveMap, vEmissiveMapUv );',
+            // Use red channel as heat; modulate slightly by green so detail in the',
+            // texture creates color variation across the surface.',
+            '  float heat = clamp( heatSample.r * 0.75 + heatSample.g * 0.35, 0.0, 1.0 );',
+            '  vec3 lavaCool = vec3( 0.08, 0.005, 0.0 );',
+            '  vec3 lavaMid  = vec3( 0.95, 0.18, 0.02 );',
+            '  vec3 lavaHot  = vec3( 1.00, 0.85, 0.30 );',
+            '  vec3 ramp = mix( lavaCool, lavaMid, smoothstep( 0.05, 0.55, heat ) );',
+            '  ramp = mix( ramp, lavaHot, smoothstep( 0.55, 0.95, heat ) );',
+            '  totalEmissiveRadiance = ramp;',
+            '#endif',
+          ].join('\n'),
+        )
+      }
+      material.customProgramCacheKey = () => 'swg-lava-v1'
+      material.userData.shaderLavaInjected = true
+      material.needsUpdate = true
+    }
+
+    function applyStoredShaderMaterialState(material: THREE.MeshPhongMaterial): void {
+      const alphaTest = Boolean(material.userData?.shaderAlphaTest)
+      const alphaRef = Number(material.userData?.shaderAlphaReference ?? 0)
+      const effectTags = Array.isArray(material.userData?.shaderEffectTags)
+        ? (material.userData.shaderEffectTags as string[])
+        : []
+      const hasPunchout = effectTags.some((tag) => tag === 'PNCH' || tag === 'PUNCHOUT')
+      if (alphaTest || hasPunchout) {
+        const ref = alphaRef > 0 ? alphaRef : (hasPunchout ? 128 : 0)
+        material.alphaTest = THREE.MathUtils.clamp(ref / 255, 0, 1)
+      } else {
+        material.alphaTest = 0
+      }
+
+      const isTransparent = Boolean(material.userData?.shaderTransparent) || Boolean(material.userData?.shaderAlphaBlend)
+      const hasAdditive = effectTags.some((tag) => tag === 'ADDT' || tag === 'ADDITIVE' || tag === 'ADD')
+      material.transparent = isTransparent || hasAdditive
+      material.blending = hasAdditive ? THREE.AdditiveBlending : THREE.NormalBlending
+      material.depthWrite = !(material.transparent)
+      material.opacity = 1
+      if (material.userData?.shaderSelfIllum) {
+        material.emissive.setRGB(1, 1, 1)
+        material.emissiveIntensity = 1
+        if (material.map) {
+          material.emissiveMap = material.map
+        }
+      } else {
+        material.emissive.setRGB(0, 0, 0)
+        material.emissiveMap = null
+      }
+      if (material.userData?.shaderLavaEffect && !material.userData?.shaderLavaInjected) {
+        applyLavaShaderInjection(material)
       }
     }
 
@@ -1580,12 +1818,29 @@ const PreviewCanvas = memo(function PreviewCanvas({
               2,
             ))
           }
+          // DEBUG: expose every authored UV set as uv3/uv4/... so the surface dump can show them.
+          if (part.uvSets && part.uvSets.length > 0) {
+            const vc = Math.floor(part.positions.length / 3)
+            for (let setIdx = 0; setIdx < part.uvSets.length; setIdx += 1) {
+              const src = part.uvSets[setIdx]
+              if (!src || src.length < vc * 2) continue
+              const attrName = `uv${setIdx + 3}` // uv3 = uvSets[0], uv4 = uvSets[1], etc.
+              partGeometry.setAttribute(
+                attrName,
+                new THREE.BufferAttribute(new Float32Array(src.slice(0, vc * 2)), 2),
+              )
+            }
+          }
           if (part.normals && part.normals.length === part.positions.length) {
             partGeometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(part.normals), 3))
           } else {
             partGeometry.computeVertexNormals()
           }
           partGeometry.translate(-center.x, -rootBounds.min.y, -center.z)
+          // DEBUG: stash the MSH decoder summary on the geometry so the surface dump can show it.
+          if (part.decodeDebug) {
+            partGeometry.userData = { ...partGeometry.userData, decodeDebug: part.decodeDebug }
+          }
 
           const partMaterial = new THREE.MeshPhongMaterial({
             color: '#ffffff',
@@ -1638,7 +1893,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
               meshPath: rootVisual.meshPath,
               appearancePath: rootVisual.appearancePath,
               shaderPath: rootVisual.meshPartShaderPaths?.[partIndex] ?? rootVisual.shaderPath,
-              effectPath: rootVisual.effectPath,
+              effectPath: rootVisual.meshPartEffectPaths?.[partIndex] ?? rootVisual.effectPath,
               sourceLabel: rootVisual.sourceLabel,
               textureLookupKey: (rootVisual.meshPartTexturePaths && rootVisual.meshPartTexturePaths[partIndex])
                 ? partTextureKey
@@ -1661,6 +1916,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
               uvCalibrationScaleU: 1,
               uvCalibrationScaleV: 1,
               uvCalibrationTargetSource: 'deterministic',
+              hardpoints: rootVisual.hardpoints,
             } satisfies SurfacePickMetadata,
           }
           partMesh.renderOrder = partDomain === 'interior' ? 0 : 1
@@ -1759,7 +2015,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
             meshPath: resolved.meshPath,
             appearancePath: resolved.appearancePath,
             shaderPath: resolved.shaderPath,
-            effectPath: resolved.effectPath,
+            effectPath: resolved.meshPartEffectPaths?.[0] ?? resolved.effectPath,
             sourceLabel: resolved.sourceLabel,
             textureLookupKey: object.templatePath ? normalizeSwgPath(object.templatePath) : undefined,
             partIndex: 0,
@@ -1775,6 +2031,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
             detailAddressU: resolved.meshPartSecondaryTextureAddressU?.[0],
             detailAddressV: resolved.meshPartSecondaryTextureAddressV?.[0],
             chunkTrace: resolved.meshPartChunkTrace?.[0],
+            hardpoints: resolved.hardpoints,
           } satisfies SurfacePickMetadata,
         }
 
@@ -1873,9 +2130,7 @@ const PreviewCanvas = memo(function PreviewCanvas({
         // Reset to placeholder first so applyTextureToMaterial can load from cache or re-fetch.
         material.map = placeholder
         material.normalMap = placeholderNormalTexRef.current
-        material.transparent = false
-        material.opacity = 1
-        material.depthWrite = true
+        applyStoredShaderMaterialStateRef.current(material)
         applyTextureToMaterialRef.current(templatePath, material, context)
       }
     }
@@ -2514,6 +2769,9 @@ function App() {
 
         if (existingTexture) {
           URL.revokeObjectURL(existingTexture.url)
+          if (existingTexture.alternateUrl) {
+            URL.revokeObjectURL(existingTexture.alternateUrl)
+          }
           if (existingTexture.normalUrl) {
             URL.revokeObjectURL(existingTexture.normalUrl)
           }
@@ -2527,6 +2785,25 @@ function App() {
         if (!url) {
           url = URL.createObjectURL(hit.file)
           objectUrlsRef.current.set(cacheKey, url)
+        }
+
+        let alternateUrl: string | undefined
+        let resolvedAlternateTexturePath: string | undefined
+        const normalizedResolvedTexturePath = resolvedTexturePath.toLowerCase()
+        for (const altCandidate of texturePathCandidates(texturePath)) {
+          const altNormalized = altCandidate.toLowerCase()
+          if (altNormalized === normalizedResolvedTexturePath) continue
+          const altSource = await resolveTextureSource(altCandidate)
+          if (!altSource) continue
+          if (altSource.resolvedPath.toLowerCase() === normalizedResolvedTexturePath) continue
+          resolvedAlternateTexturePath = altSource.resolvedPath
+          const altCacheKey = `${keyPath}|alt|${resolvedAlternateTexturePath}`
+          alternateUrl = objectUrlsRef.current.get(altCacheKey)
+          if (!alternateUrl) {
+            alternateUrl = URL.createObjectURL(altSource.source.file)
+            objectUrlsRef.current.set(altCacheKey, alternateUrl)
+          }
+          break
         }
 
         let normalUrl: string | undefined
@@ -2564,6 +2841,8 @@ function App() {
         next[keyPath] = {
           url,
           texturePath: resolvedTexturePath,
+          alternateUrl,
+          alternateTexturePath: alternateUrl ? resolvedAlternateTexturePath : undefined,
           textureAddressU,
           textureAddressV,
           textureMipmapFilter,

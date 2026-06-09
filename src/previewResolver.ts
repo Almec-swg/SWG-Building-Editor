@@ -9,6 +9,8 @@ export interface PreviewMeshData {
   uvSets?: number[][] // All declared UV sets by index (0..N-1)
   /** True when the vertex format declares a UV channel; false when confirmed absent; undefined when unknown. */
   hasUvChannel?: boolean
+  /** Debug-only: human-readable summary of how the MSH decoder interpreted this part's vertex stream. */
+  decodeDebug?: string
 }
 
 export interface RepositorySourceFile {
@@ -54,7 +56,10 @@ export interface ResolvedTemplateVisual {
   meshPartSecondaryTextureAddressV?: (TextureAddressMode | undefined)[]
   meshPartChunkTrace?: (string | undefined)[]
   meshPartShaderPaths?: (string | undefined)[]
+  meshPartEffectPaths?: (string | undefined)[]
   meshPartDomains?: ('exterior' | 'interior')[]
+  /** Hardpoints (HPNT chunks) discovered along the appearance / cell / CMP chain. */
+  hardpoints?: MeshHardpoint[]
   effectPath?: string
   effectOptionCodes?: string[]
   vertexProgramPaths?: string[]
@@ -62,6 +67,20 @@ export interface ResolvedTemplateVisual {
   shaderStageTexturePaths?: string[]
   shaderStageNormalTexturePaths?: string[]
   status: 'mesh' | 'appearance-only' | 'object-only' | 'missing'
+}
+
+/**
+ * A SWG HPNT chunk: a named anchor on a mesh/appearance used by the engine to
+ * attach child objects (door handles, signage, weapons on racks, etc.) or to
+ * mark positions of interest (door portals, FX origins). The matrix is a
+ * mesh-local affine transform laid out as three rows of (Rx, Ry, Rz, Tx).
+ */
+export interface MeshHardpoint {
+  name: string
+  /** 12 floats, row-major 3x4: [R0xyz, T0, R1xyz, T1, R2xyz, T2]. */
+  matrix: number[]
+  /** IFF file the hardpoint was discovered in (MSH/CMP/POB/etc.). */
+  sourcePath?: string
 }
 
 export type RepositoryLookup = (path: string) => Promise<RepositorySourceFile | null>
@@ -120,6 +139,8 @@ const shaderStageRefsCache = new Map<string, {
   alphaReference: number
   transparent: boolean
   alphaBlend: boolean
+  selfIllum: boolean
+  lavaEffect: boolean
   effectTags: string[]
   shaderDebugChunks?: string[]
 }>()
@@ -129,6 +150,7 @@ const effectRecipeCache = new Map<string, {
   pixelPrograms: string[]
 }>()
 const effectDeclaredTextureRefsCache = new Map<string, Array<{ path: string; slot: ShaderTextureSlot; order: number }>>()
+const effectDebugChunksCache = new Map<string, string[]>()
 const resolvedRefCandidatesCache = new Map<string, string[]>()
 
 export function clearPreviewResolverCaches(): void {
@@ -136,6 +158,7 @@ export function clearPreviewResolverCaches(): void {
   shaderStageRefsCache.clear()
   effectRecipeCache.clear()
   effectDeclaredTextureRefsCache.clear()
+  effectDebugChunksCache.clear()
   resolvedRefCandidatesCache.clear()
 }
 
@@ -145,11 +168,56 @@ export function getShaderDebugChunks(shaderPath: string): string[] | undefined {
   return cached?.shaderDebugChunks
 }
 
+export function getEffectDebugChunks(effectPath: string): string[] | undefined {
+  const normalized = normalizeSwgPath(effectPath)
+  return effectDebugChunksCache.get(normalized)
+}
+
+function captureEffectDebugChunks(effectBuffer: ArrayBuffer, effectPath: string): string[] {
+  const normalized = normalizeSwgPath(effectPath)
+  const cached = effectDebugChunksCache.get(normalized)
+  if (cached) return cached
+  const bytes = new Uint8Array(effectBuffer)
+  const root = parseBigEndianChunks(bytes)
+  const out: string[] = []
+  if (!root) {
+    effectDebugChunksCache.set(normalized, out)
+    return out
+  }
+  const walk = (node: BinaryChunk, depth = 0) => {
+    const indent = '  '.repeat(depth)
+    if (node.type) {
+      out.push(`${indent}${node.tag}:${node.type}`)
+    } else {
+      const dataSize = node.dataEnd - node.dataStart
+      const maxBytesToShow = 4096
+      if (dataSize > 0 && dataSize <= maxBytesToShow) {
+        const hex: string[] = []
+        const ascii: string[] = []
+        for (let i = node.dataStart; i < node.dataEnd; i++) {
+          const b = bytes[i]
+          hex.push(b.toString(16).padStart(2, '0'))
+          ascii.push(b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.')
+        }
+        out.push(`${indent}${node.tag} (${dataSize}B) [${hex.join(' ')}] "${ascii.join('')}"`)
+      } else {
+        out.push(`${indent}${node.tag} (${dataSize} bytes - truncated)`)
+      }
+    }
+    for (const child of node.children) walk(child, depth + 1)
+  }
+  walk(root)
+  effectDebugChunksCache.set(normalized, out)
+  return out
+}
+
 export function getShaderRenderProps(shaderPath: string): {
   alphaTest: boolean
   alphaReference: number
   transparent: boolean
   alphaBlend: boolean
+  selfIllum: boolean
+  lavaEffect: boolean
   effectTags: string[]
 } | undefined {
   const normalized = normalizeSwgPath(shaderPath)
@@ -160,6 +228,8 @@ export function getShaderRenderProps(shaderPath: string): {
     alphaReference: cached.alphaReference,
     transparent: cached.transparent,
     alphaBlend: cached.alphaBlend,
+    selfIllum: cached.selfIllum,
+    lavaEffect: cached.lavaEffect,
     effectTags: [...cached.effectTags],
   }
 }
@@ -210,11 +280,41 @@ function extensionDirectories(fileExt: string): string[] {
   return []
 }
 
+// Known SWG asset subdirectories that may appear as a leading segment on a
+// "relative" ref inside a nested LOD/CMP/APT chain. When a ref begins with one
+// of these, it is anchored to a parent of the referencing file's directory
+// (e.g. an LOD at `appearance/lod/foo.lod` referencing `component/bar.cmp`
+// resolves to `appearance/component/bar.cmp`, not `appearance/lod/component/...`).
+const SWG_KNOWN_SUBDIRS = [
+  'appearance',
+  'mesh',
+  'lod',
+  'component',
+  'collision',
+  'texture',
+  'shader',
+  'effect',
+  'object',
+  'animation',
+  'skeletal_mesh',
+  'skeletal_animation',
+  'skeleton',
+  'palette',
+  'sound',
+  'string',
+  'datatables',
+] as const
+
+function refHasKnownSubdirPrefix(clean: string): boolean {
+  const slash = clean.indexOf('/')
+  if (slash <= 0) return false
+  const first = clean.slice(0, slash)
+  return (SWG_KNOWN_SUBDIRS as readonly string[]).includes(first)
+}
+
 function resolveRefCandidates(basePath: string, ref: string): string[] {
   const clean = normalizeSwgPath(ref)
-  // SWG uses exact paths as they appear in the data files.
-  // If the reference contains a directory separator, use it exactly.
-  if (clean.includes('/')) return [clean]
+  if (!clean) return []
 
   const results: string[] = []
   const seen = new Set<string>()
@@ -225,6 +325,36 @@ function resolveRefCandidates(basePath: string, ref: string): string[] {
     results.push(normalized)
   }
 
+  // Path 1: ref already contains a directory separator.
+  if (clean.includes('/')) {
+    // Priority 1a: the literal path as-written. This preserves current behavior
+    // for refs that are absolute (`appearance/...`, `texture/...`, etc.).
+    push(clean)
+
+    // Priority 1b: if the ref starts with a known SWG subdir but the base is
+    // anchored deeper (e.g. base `appearance/lod/x.lod`, ref `component/y.cmp`),
+    // try anchoring the ref under each ancestor directory of the base path.
+    // This handles nested LOD/CMP/APT chains whose refs are relative to the
+    // appearance subtree rather than to the immediate file directory.
+    if (refHasKnownSubdirPrefix(clean) && !clean.startsWith('appearance/')) {
+      const base = normalizeSwgPath(basePath)
+      const segments = base.split('/').filter(Boolean)
+      // Drop the filename segment.
+      if (segments.length > 0) segments.pop()
+      // Walk from deepest parent up to root, trying each as an anchor.
+      for (let i = segments.length - 1; i >= 0; i--) {
+        const anchor = segments.slice(0, i).join('/')
+        push(anchor ? `${anchor}/${clean}` : clean)
+      }
+      // Finally, try anchoring under `appearance/` explicitly (covers refs
+      // that are relative to the appearance root even when the base is not).
+      push(`appearance/${clean}`)
+    }
+
+    return results
+  }
+
+  // Path 2: bare filename, no directory separator.
   // Priority 1: Relative to the referencing file's directory (same directory as shader/mesh)
   const dir = dirname(normalizeSwgPath(basePath))
   if (dir) push(`${dir}/${clean}`)
@@ -832,28 +962,63 @@ function extractUvsFromFvfFlags(
   vertexFlags: number,
   uvSetIndex = 0,
 ): number[] | undefined {
-  // Strict parity mode: reject FVF decodes unless the implied stride matches
-  // the observed vertex stride exactly. This prevents malformed INFO flags from
-  // pulling UVs from the wrong offsets.
+  // FVF parity:
+  //  - For uvSetIndex 0 we accept any bytesPerVertex >= expectedStride. Extra
+  //    bytes commonly carry tangent + handedness (trailing) for normal-mapped
+  //    meshes, or D3DCOLOR diffuse/specular (between normal and UV) for some
+  //    interior meshes. We try the canonical offset first and, if the values
+  //    look like sentinels (non-finite or magnitudes far outside any plausible
+  //    UV range), we walk forward in 4-byte steps until we find a stream that
+  //    passes a sanity check. This rescues palace-exterior (UV at the
+  //    canonical offset with trailing tangent) and palace-interior (UV after
+  //    a 4-byte color field).
+  //  - For uvSetIndex >= 1 we still require exact parity, because guessing a
+  //    secondary UV offset is fragile and almost always wrong when the stride
+  //    does not match the declared texCount.
   const texCount = (vertexFlags & 0x0f00) >>> 8
   if (texCount === 0 || uvSetIndex >= texCount) return undefined
   const baseUvOffset = uvOffsetFromFvfFlags(vertexFlags, bytesPerVertex)
   const expectedStride = baseUvOffset + texCount * 8
-  if (expectedStride !== bytesPerVertex) return undefined
+  if (uvSetIndex === 0) {
+    if (bytesPerVertex < expectedStride) return undefined
+  } else {
+    if (expectedStride !== bytesPerVertex) return undefined
+  }
 
-  const uvOffset = baseUvOffset + uvSetIndex * 8
-  if (uvOffset + 8 > bytesPerVertex) return undefined
+  const canonicalOffset = baseUvOffset + uvSetIndex * 8
+  if (canonicalOffset + 8 > bytesPerVertex) return undefined
 
   const view = new DataView(dataPayload.buffer, dataPayload.byteOffset, dataPayload.byteLength)
-  const out: number[] = []
-  for (let i = 0; i < numVertices; i++) {
-    const base = i * bytesPerVertex + uvOffset
-    if (base + 8 > dataPayload.length) break
-    const u = view.getFloat32(base, true)
-    const v = view.getFloat32(base + 4, true)
-    out.push(Number.isFinite(u) ? u : 0, Number.isFinite(v) ? v : 0)
+
+  // Sanity threshold for "looks like a UV": values must be finite and within
+  // a generous tiling envelope. Real SWG UVs occasionally tile beyond [0,1]
+  // (e.g. -6..9 on the throne mesh) but never approach 1e6 — that magnitude
+  // only appears when we land in a packed-color / NaN-sentinel field.
+  const isPlausibleUv = (u: number, v: number): boolean => {
+    if (!Number.isFinite(u) || !Number.isFinite(v)) return false
+    if (Math.abs(u) > 1_000_000 || Math.abs(v) > 1_000_000) return false
+    return true
   }
-  return out.length >= numVertices * 2 ? out : undefined
+
+  // For set 0 we may need to shift forward past padding/color fields. For
+  // higher sets we keep the canonical offset only.
+  const maxShift = uvSetIndex === 0 ? bytesPerVertex - (canonicalOffset + 8) : 0
+  for (let shift = 0; shift <= maxShift; shift += 4) {
+    const uvOffset = canonicalOffset + shift
+    if (uvOffset + 8 > bytesPerVertex) break
+    const out: number[] = []
+    let allPlausible = true
+    for (let i = 0; i < numVertices; i++) {
+      const base = i * bytesPerVertex + uvOffset
+      if (base + 8 > dataPayload.length) { allPlausible = false; break }
+      const u = view.getFloat32(base, true)
+      const v = view.getFloat32(base + 4, true)
+      if (!isPlausibleUv(u, v)) { allPlausible = false; break }
+      out.push(u, v)
+    }
+    if (allPlausible && out.length >= numVertices * 2) return out
+  }
+  return undefined
 }
 
 function scoreUvCandidate(uvs: number[] | undefined, numVertices: number): number {
@@ -1031,21 +1196,71 @@ function decodeStructuredMeshFromScope(bytes: Uint8Array, scope: BinaryChunk): P
   if (fallback.length < 3) return null
 
   const meshNormals = normals.length === vertexCount * 3 ? normals : undefined
+  const allUvSets = fvfTexCount !== undefined && fvfTexCount > 0
+    ? Array.from({ length: fvfTexCount }, (_, uvSetIndex) =>
+        extractUvsFromFvfFlags(dataPayload, vertexCount, bytesPerVertex, vertexFlags, uvSetIndex),
+      ).filter((set): set is number[] => Boolean(set && set.length >= vertexCount * 2))
+    : []
+
+  // Build a decode-debug summary so the surface picker can show what the MSH decoder actually saw.
+  const decodeDebugLines: string[] = []
+  decodeDebugLines.push(`vertexFlags=0x${vertexFlags.toString(16).padStart(8, '0')} fvfTexCount=${fvfTexCount ?? 'n/a'} bytesPerVertex=${bytesPerVertex} numVertices=${numVertices} hasNormalsInVertex=${hasNormalsInVertex} uvOffset=${uvOffsetFromFvfFlags(vertexFlags, bytesPerVertex)}`)
+  const maxBytesToDump = Math.min(dataPayload.length, bytesPerVertex * Math.min(vertexCount, 8))
+  const hexBytes: string[] = []
+  for (let i = 0; i < maxBytesToDump; i++) hexBytes.push(dataPayload[i].toString(16).padStart(2, '0'))
+  for (let v = 0; v < Math.min(vertexCount, 8); v++) {
+    const start = v * bytesPerVertex * 2
+    const end = start + bytesPerVertex * 2
+    const hex = hexBytes.slice(v * bytesPerVertex, (v + 1) * bytesPerVertex).join(' ')
+    decodeDebugLines.push(`vtxRaw[${v}] ${hex}`)
+    void start; void end
+  }
+  for (let s = 0; s < allUvSets.length; s++) {
+    const set = allUvSets[s]
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+    for (let i = 0; i + 1 < set.length; i += 2) {
+      const u = set[i], vv = set[i + 1]
+      if (u < minU) minU = u; if (u > maxU) maxU = u
+      if (vv < minV) minV = vv; if (vv > maxV) maxV = vv
+    }
+    decodeDebugLines.push(`uvSet[${s}] range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+  }
+  // Try alternate UV offsets so we can see if there's a stream that actually varies with position.
+  for (let altOffset = 12; altOffset + 8 <= bytesPerVertex; altOffset += 4) {
+    if (altOffset === uvOffsetFromFvfFlags(vertexFlags, bytesPerVertex)) continue
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+    let allFinite = true
+    for (let i = 0; i < vertexCount; i++) {
+      const base = i * bytesPerVertex + altOffset
+      if (base + 8 > dataPayload.length) { allFinite = false; break }
+      const u = dataView.getFloat32(base, true)
+      const v = dataView.getFloat32(base + 4, true)
+      if (!Number.isFinite(u) || !Number.isFinite(v) || Math.abs(u) > 1e6 || Math.abs(v) > 1e6) { allFinite = false; break }
+      if (u < minU) minU = u; if (u > maxU) maxU = u
+      if (v < minV) minV = v; if (v > maxV) maxV = v
+    }
+    if (allFinite) {
+      decodeDebugLines.push(`altOffset=${altOffset} range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+    }
+  }
+  const decodeDebug = decodeDebugLines.join('\n')
+
   const raw: PreviewMeshData = {
     positions,
     indices: fallback,
     normals: meshNormals,
     uvs,
     uvs1,
-    uvSets: fvfTexCount !== undefined && fvfTexCount > 0
-      ? Array.from({ length: fvfTexCount }, (_, uvSetIndex) =>
-          extractUvsFromFvfFlags(dataPayload, vertexCount, bytesPerVertex, vertexFlags, uvSetIndex),
-        ).filter((set): set is number[] => Boolean(set && set.length >= vertexCount * 2))
-      : [],
+    uvSets: allUvSets,
     hasUvChannel,
+    decodeDebug,
   }
   const pruned = pruneSpikyTriangles(raw)
-  return pruned && pruned.indices.length >= 3 ? pruned : raw
+  if (pruned && pruned.indices.length >= 3) {
+    pruned.decodeDebug = decodeDebug
+    return pruned
+  }
+  return raw
 }
 
 function extractStrictSpsMshMeshes(bytes: Uint8Array, root: BinaryChunk): PreviewMeshData[] {
@@ -1206,6 +1421,44 @@ function extractStructuredMshMeshes(bytes: Uint8Array, root: BinaryChunk): Previ
       uvs1,
       uvSets: uvSets.length > 0 ? uvSets : undefined,
       hasUvChannel,
+    }
+    // DEBUG: capture how the strict SPS decoder interpreted this part's vertex stream.
+    {
+      const ddLines: string[] = []
+      ddLines.push(`[strictSps] vertexFlags=0x${vertexFlags.toString(16).padStart(8, '0')} fvfTexCount=${fvfTexCount ?? 'n/a'} bytesPerVertex=${bytesPerVertex} numVertices=${numVertices} hasNormalsInVertex=${hasNormalsInVertex}`)
+      const dumpVerts = Math.min(vertexCount, 8)
+      for (let v = 0; v < dumpVerts; v++) {
+        const start = v * bytesPerVertex
+        const end = Math.min(start + bytesPerVertex, dataPayload.length)
+        const hex: string[] = []
+        for (let b = start; b < end; b++) hex.push(dataPayload[b].toString(16).padStart(2, '0'))
+        ddLines.push(`vtxRaw[${v}] ${hex.join(' ')}`)
+      }
+      for (let s = 0; s < uvSets.length; s++) {
+        const set = uvSets[s]
+        let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+        for (let i = 0; i + 1 < set.length; i += 2) {
+          const u = set[i], vv = set[i + 1]
+          if (u < minU) minU = u; if (u > maxU) maxU = u
+          if (vv < minV) minV = vv; if (vv > maxV) maxV = vv
+        }
+        ddLines.push(`uvSet[${s}] range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+      }
+      for (let altOffset = 12; altOffset + 8 <= bytesPerVertex; altOffset += 4) {
+        let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity
+        let ok = true
+        for (let i = 0; i < vertexCount; i++) {
+          const base2 = i * bytesPerVertex + altOffset
+          if (base2 + 8 > dataPayload.length) { ok = false; break }
+          const u = dataView.getFloat32(base2, true)
+          const v2 = dataView.getFloat32(base2 + 4, true)
+          if (!Number.isFinite(u) || !Number.isFinite(v2) || Math.abs(u) > 1e6 || Math.abs(v2) > 1e6) { ok = false; break }
+          if (u < minU) minU = u; if (u > maxU) maxU = u
+          if (v2 < minV) minV = v2; if (v2 > maxV) maxV = v2
+        }
+        if (ok) ddLines.push(`altOffset=${altOffset} range=(${minU.toFixed(4)},${minV.toFixed(4)})->(${maxU.toFixed(4)},${maxV.toFixed(4)})`)
+      }
+      raw.decodeDebug = ddLines.join('\n')
     }
     const rawScore = scoreIndexTopology(raw.positions, raw.indices)
     if (!Number.isFinite(rawScore)) continue
@@ -1733,6 +1986,7 @@ function pruneSpikyTriangles(mesh: PreviewMeshData): PreviewMeshData | null {
     uvs1: mesh.uvs1,
     uvSets: mesh.uvSets,
     hasUvChannel: mesh.hasUvChannel,
+    decodeDebug: mesh.decodeDebug,
   }
 }
 
@@ -2331,6 +2585,8 @@ function extractShaderStageTextureRefs(
   alphaReference: number
   transparent: boolean
   alphaBlend: boolean
+  selfIllum: boolean
+  lavaEffect: boolean
   effectTags: string[]
   shaderDebugChunks?: string[]  // For debugging
 } {
@@ -2357,6 +2613,8 @@ function extractShaderStageTextureRefs(
     alphaReference: 0,
     transparent: false,
     alphaBlend: false,
+    selfIllum: false,
+    lavaEffect: false,
     effectTags: [] as string[],
   }
   if (!root) return empty
@@ -2442,32 +2700,41 @@ function extractShaderStageTextureRefs(
   let tcssPayloadsParsed = 0
   let tcssRecognizedAssignments = 0
   const tcssUniqueAssignmentKeys = new Set<string>()
+  let txmPrimaryUvSetFallback: number | undefined
+  let txmSecondaryUvSetFallback: number | undefined
+  let txmNormalUvSetFallback: number | undefined
   
   // Material properties
   let alphaTest = false
   let alphaReference = 0
   let transparent = false
   let alphaBlend = false
+  let selfIllum = false
+  let lavaEffect = false
   const effectTags: string[] = []
   const shaderDebugChunks: string[] = []  // Capture all chunks for debugging
   
-  // Capture chunk structure for debugging
+  // Capture chunk structure for debugging.
+  // SHT files are small (typically a few KB total). Show full hex for ALL chunks
+  // up to 4096 bytes so we never truncate the data needed to diagnose UV/sampler issues.
   function captureChunkStructure(node: BinaryChunk, depth = 0) {
     const indent = '  '.repeat(depth)
     if (node.type) {
       shaderDebugChunks.push(`${indent}${node.tag}:${node.type}`)
     } else {
       const dataSize = node.dataEnd - node.dataStart
-      // Show full hex for important material chunks, otherwise limit to first 32 bytes
-      const maxBytesToShow = (node.tag === 'MATL' || node.tag === 'ALPH' || node.tag === 'TAG' || node.tag === 'EFCT') ? 256 : 32
+      const maxBytesToShow = 4096
       if (dataSize > 0 && dataSize <= maxBytesToShow) {
-        const hexBytes = []
+        const hexBytes: string[] = []
+        const asciiBytes: string[] = []
         for (let i = node.dataStart; i < node.dataEnd; i++) {
-          hexBytes.push(bytes[i].toString(16).padStart(2, '0'))
+          const b = bytes[i]
+          hexBytes.push(b.toString(16).padStart(2, '0'))
+          asciiBytes.push(b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.')
         }
-        shaderDebugChunks.push(`${indent}${node.tag} [${hexBytes.join(' ')}]`)
+        shaderDebugChunks.push(`${indent}${node.tag} (${dataSize}B) [${hexBytes.join(' ')}] "${asciiBytes.join('')}"`)
       } else {
-        shaderDebugChunks.push(`${indent}${node.tag} (${dataSize} bytes)`)
+        shaderDebugChunks.push(`${indent}${node.tag} (${dataSize} bytes - truncated)`)
       }
     }
     for (const child of node.children) {
@@ -2479,11 +2746,79 @@ function extractShaderStageTextureRefs(
   // Track what FORM chunks we encounter
   const formChunks = new Set<string>()
 
+  const applyEffectTag = (raw: string): void => {
+    const tagValue = raw.trim().toUpperCase()
+    if (!tagValue || !/^[A-Z0-9_]{3,8}$/.test(tagValue)) return
+    if (!effectTags.includes(tagValue)) {
+      effectTags.push(tagValue)
+      console.log(`[Shader Effect] Found TAG: ${tagValue}`)
+    }
+
+    if (tagValue === 'ALPH' || tagValue === 'TRNS' || tagValue === 'BLND' || tagValue === 'TRANSPARENT') {
+      transparent = true
+      alphaBlend = true
+    }
+    if (tagValue === 'PNCH' || tagValue === 'PUNCHOUT') {
+      alphaTest = true
+      if (alphaReference === 0) alphaReference = 128
+    }
+    if (tagValue === 'ADDT' || tagValue === 'ADDITIVE' || tagValue === 'ADD') {
+      transparent = true
+      alphaBlend = true
+    }
+  }
+
   const visit = (node: BinaryChunk) => {
     if (node.tag === 'FORM' && node.type) {
       formChunks.add(node.type)
+      // NOTE: ARVS (Alpha Reference Value Source) is NOT a reliable alpha-blend
+      // signal on its own. Envmask/spec shaders (e.g. a_envmask_specmap.eft)
+      // include ARVS to point at the spec map's alpha channel for env masking,
+      // even though the rendered material is opaque. Rely on the effect-name
+      // family below for the actual transparency decision.
     }
-    
+
+    // SHT references its effect via a NAME chunk at the top level. Effect
+    // file names follow the convention "effect\a_alpha*.eft", "effect\a_add*.eft",
+    // "effect\a_trans*.eft" for alpha/additive variants. Detect from the name
+    // so we don't have to also parse every .eft to learn the blend mode.
+    if (node.tag === 'NAME' && node.size >= 5 && node.size <= 128) {
+      let s = ''
+      for (let i = node.dataStart; i < node.dataEnd; i++) {
+        const b = bytes[i]
+        if (b === 0) break
+        if (b >= 0x20 && b <= 0x7e) s += String.fromCharCode(b)
+      }
+      const lower = s.toLowerCase()
+      if (lower.endsWith('.eft')) {
+        // Common alpha-blended effect families.
+        if (
+          lower.includes('a_alpha') ||
+          lower.includes('a_trans') ||
+          lower.includes('a_glass') ||
+          lower.includes('a_add')
+        ) {
+          transparent = true
+          alphaBlend = true
+        }
+        // Self-illuminated / emissive effect families. The actual pixel
+        // shaders for these (a_lava_*, a_emis_*, a_glow_*) bypass scene
+        // lighting and either sample a colorramp by heat or just blast the
+        // diffuse texture as emission. We approximate by flagging the
+        // material so the renderer can set emissive + emissiveMap.
+        if (
+          lower.includes('a_lava') ||
+          lower.includes('a_emis') ||
+          lower.includes('a_glow')
+        ) {
+          selfIllum = true
+        }
+        if (lower.includes('a_lava')) {
+          lavaEffect = true
+        }
+      }
+    }
+
     if (node.tag === 'FORM' && node.type === 'TXMS') {
       hasTxms = true
       for (const txm of node.children) {
@@ -2501,6 +2836,7 @@ function extractShaderStageTextureRefs(
           let slotMipmapFilter: TextureFilterMode | undefined
           let slotMinificationFilter: TextureFilterMode | undefined
           let slotMagnificationFilter: TextureFilterMode | undefined
+          let slotUvSetFallback: number | undefined
           for (const child of versionForm.children) {
             if (child.tag === 'DATA' && child.size >= 4 && slotTag === '') {
               // First 4 bytes of DATA identify the slot (NIAM, LMRN, ATED, MVNE, CEPS, …).
@@ -2531,6 +2867,13 @@ function extractShaderStageTextureRefs(
                   slotMinificationFilter = decodeFilterMode(bytes[child.dataStart + 9])
                   slotMagnificationFilter = decodeFilterMode(bytes[child.dataStart + 10])
                 }
+                if (child.size >= 12) {
+                  // Fallback UV set source: TXM DATA mode byte (slot-local).
+                  // This is used only when TCSS is absent/undecodable.
+                  const uvModeRaw = bytes[child.dataStart + 11]
+                  const uvSet = uvModeRaw & 0x07
+                  if (uvSet <= 7) slotUvSetFallback = uvSet
+                }
               } else if (child.size >= 10) {
                 // Legacy fallback for older assumptions.
                 slotAddressU = decodeAddressMode(bytes[child.dataStart + 8])
@@ -2554,6 +2897,7 @@ function extractShaderStageTextureRefs(
               if (seenBySlot.MAIN.has(ref)) continue
               seenBySlot.MAIN.add(ref)
               mainTextures.push(ref)        // MAIN → primary diffuse
+              if (slotUvSetFallback !== undefined) txmPrimaryUvSetFallback ??= slotUvSetFallback
               primaryAddressU ??= slotAddressU
               primaryAddressV ??= slotAddressV
               primaryMipmapFilter ??= slotMipmapFilter
@@ -2563,12 +2907,14 @@ function extractShaderStageTextureRefs(
               if (seenBySlot.NRML.has(ref)) continue
               seenBySlot.NRML.add(ref)
               normalTextures.push(ref) // NRML → normal map
+              if (slotUvSetFallback !== undefined) txmNormalUvSetFallback ??= slotUvSetFallback
               normalAddressU ??= slotAddressU
               normalAddressV ??= slotAddressV
             } else if (slotTag === 'DETA') {
               if (seenBySlot.DETA.has(ref)) continue
               seenBySlot.DETA.add(ref)
               detailTextures.push(ref)  // DETA → detail overlay blend
+              if (slotUvSetFallback !== undefined) txmSecondaryUvSetFallback ??= slotUvSetFallback
               secondaryAddressU ??= slotAddressU
               secondaryAddressV ??= slotAddressV
             }
@@ -2659,6 +3005,17 @@ function extractShaderStageTextureRefs(
         parse5ByteEntries(4)
         parse8ByteEntries(0)
         parse8ByteEntries(4)
+
+        // Robust fallback: only use sliding token scan when structured layouts yielded nothing.
+        if (!applied) {
+          for (let off = 0; off + 4 < payload.length; off += 1) {
+            const rawTag = String.fromCharCode(payload[off], payload[off + 1], payload[off + 2], payload[off + 3])
+            const normalized = normalizeShaderSlotTag(rawTag)
+            if (normalized !== 'MAIN' && normalized !== 'DETA' && normalized !== 'NRML') continue
+            const uvIndexRaw = payload[off + 4]
+            if (applyTcssEntry(rawTag, uvIndexRaw)) applied = true
+          }
+        }
 
         return applied
       }
@@ -2756,26 +3113,33 @@ function extractShaderStageTextureRefs(
       }
     }
 
-    // Parse EFCT (Effect) tags
+    // Parse EFCT/TAG effect tags
     if (node.tag === 'TAG ' && node.size === 4) {
-      const tagValue = String.fromCharCode(
+      const tagRaw = String.fromCharCode(
         bytes[node.dataStart],
         bytes[node.dataStart + 1],
         bytes[node.dataStart + 2],
         bytes[node.dataStart + 3]
-      ).trim()
-      if (tagValue && !effectTags.includes(tagValue)) {
-        effectTags.push(tagValue)
-        console.log(`[Shader Effect] Found TAG: ${tagValue}`)
-        
-        // Check for transparency indicators
-        if (tagValue === 'ALPH' || tagValue === 'TRNS' || tagValue === 'BLND') {
-          transparent = true
-          alphaBlend = true
+      )
+      applyEffectTag(tagRaw)
+    }
+
+    if (node.tag === 'DATA' && node.size >= 4) {
+      const parent = findParentChunk(root, node)
+      if (parent?.tag === 'FORM' && parent.type === 'EFCT') {
+        const payload = bytes.subarray(node.dataStart, node.dataEnd)
+        // EFCT payloads can encode 4-byte tag tokens and/or inline ASCII tag names.
+        for (let i = 0; i + 3 < payload.length; i += 4) {
+          const token = String.fromCharCode(payload[i], payload[i + 1], payload[i + 2], payload[i + 3])
+          applyEffectTag(token)
         }
-        if (tagValue === 'PNCH') {
-          alphaTest = true
-          if (alphaReference === 0) alphaReference = 128 // Default for punchout
+
+        const ascii = extractAsciiStrings(
+          payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
+          3,
+        )
+        for (const str of ascii) {
+          applyEffectTag(str)
         }
       }
     }
@@ -2797,6 +3161,14 @@ function extractShaderStageTextureRefs(
   }
 
   visit(root)
+
+  // Fallback UV set assignment from TXM DATA when TCSS is absent or undecodable.
+  if (tcssRecognizedAssignments === 0) {
+    if (txmPrimaryUvSetFallback !== undefined) primaryUvSetIndex = txmPrimaryUvSetFallback
+    if (txmSecondaryUvSetFallback !== undefined) secondaryUvSetIndex = txmSecondaryUvSetFallback
+    if (txmNormalUvSetFallback !== undefined) normalUvSetIndex = txmNormalUvSetFallback
+  }
+
   // normalUvSetIndex is recorded for future use but not yet wired into the result
   void normalUvSetIndex
   
@@ -2834,6 +3206,8 @@ function extractShaderStageTextureRefs(
     alphaReference,
     transparent,
     alphaBlend,
+    selfIllum,
+    lavaEffect,
     effectTags,
     shaderDebugChunks,
   }
@@ -2890,6 +3264,7 @@ async function resolveMshPartMeshesWithTextures(
   secondaryScaleV: (number | undefined)[]
   secondaryUvSetIndices: number[]
   chunkTrace: (string | undefined)[]
+  effectPaths: (string | undefined)[]
 } | null> {
   const source = await lookup(meshPath)
   if (!source) return null
@@ -2933,6 +3308,7 @@ async function resolveMshPartMeshesWithTextures(
   const secondaryScaleV: (number | undefined)[] = []
   const secondaryUvSetIndices: number[] = []
   const chunkTrace: (string | undefined)[] = []
+  const effectPaths: (string | undefined)[] = []
 
   for (const partForm of partForms) {
     const mesh = decodeStructuredMeshFromScope(bytes, partForm)
@@ -3103,6 +3479,28 @@ async function resolveMshPartMeshesWithTextures(
     secondaryScaleV.push(partSecondaryScaleV)
     secondaryUvSetIndices.push(partSecondaryUvSetIndex)
     chunkTrace.push(partChunkTrace)
+
+    // Resolve & cache the effect (.eft) file referenced by the part's shader so the
+    // surface-pick dump can show the effect chunks (which define UV transforms / DOT3 / blend ops).
+    let partEffectPath: string | undefined
+    if (partShaderPath) {
+      try {
+        const shaderSource = await lookup(partShaderPath)
+        if (shaderSource) {
+          const shaderBuffer = await shaderSource.file.arrayBuffer()
+          const shaderRefs = getResolvedRefCandidatesCached(partShaderPath, shaderBuffer)
+          const effectHit = await resolveFirstExistingByExt(shaderRefs, ['.eft'], lookup)
+          if (effectHit) {
+            partEffectPath = effectHit.path
+            const effectBuffer = await effectHit.source.file.arrayBuffer()
+            captureEffectDebugChunks(effectBuffer, effectHit.path)
+          }
+        }
+      } catch {
+        // Non-fatal: effect resolution is debug-only.
+      }
+    }
+    effectPaths.push(partEffectPath)
   }
 
   if (parts.length === 0) return null
@@ -3128,6 +3526,7 @@ async function resolveMshPartMeshesWithTextures(
     secondaryScaleV,
     secondaryUvSetIndices,
     chunkTrace,
+    effectPaths,
   }
 }
 
@@ -3365,6 +3764,7 @@ interface DecodedMeshHit {
   meshPartSecondaryTextureAddressV?: (TextureAddressMode | undefined)[]
   meshPartSecondaryUvSetIndices?: number[]
   meshPartChunkTrace?: (string | undefined)[]
+  meshPartEffectPaths?: (string | undefined)[]
 }
 
 interface ParsedInlineString {
@@ -3495,7 +3895,10 @@ function decodeCellDataTransformMatrix(dataPayload: Uint8Array, minOffset = 0): 
   return undefined
 }
 
-function extractCellMeshRefFromDataChunk(dataPayload: Uint8Array): { meshRef: string; matrix?: number[] } | null {
+function extractCellMeshRefFromDataChunk(
+  dataPayload: Uint8Array,
+  includeOutsideWorld = false,
+): { meshRef: string; matrix?: number[] } | null {
   // Vanguard source parity for CELL DATA:
   // int numberOfPortals; byte unk; string name; string meshFile; byte floorFlag; [string floorFile]
   if (dataPayload.length < 8) return null
@@ -3514,8 +3917,8 @@ function extractCellMeshRefFromDataChunk(dataPayload: Uint8Array): { meshRef: st
     const meshFile = meshRead.value.trim()
     if (!meshFile || !/\.(?:apt|msh|lod|cmp)$/i.test(meshFile)) continue
 
-    // Skip likely outside/world cell meshes to avoid stacking exterior shell as interior.
-    if (/(^|[_/])(world|outside)([_/]|$)/i.test(cellName)) {
+    // Interior assembly should skip outside/world cells; exterior traversal may include them.
+    if (!includeOutsideWorld && /(^|[_/])(world|outside)([_/]|$)/i.test(cellName)) {
       continue
     }
 
@@ -3542,7 +3945,11 @@ function extractCellMeshRefFromDataChunk(dataPayload: Uint8Array): { meshRef: st
   return null
 }
 
-function extractPobCellAppearanceRefs(buffer: ArrayBuffer, basePath: string): PobCellAppearanceEntry[] {
+function extractPobCellAppearanceRefs(
+  buffer: ArrayBuffer,
+  basePath: string,
+  includeOutsideWorld = false,
+): PobCellAppearanceEntry[] {
   const bytes = new Uint8Array(buffer)
   const root = parseBigEndianChunks(bytes)
   if (!root) return []
@@ -3554,7 +3961,7 @@ function extractPobCellAppearanceRefs(buffer: ArrayBuffer, basePath: string): Po
     const dataChunk = flattenChunkSubtree(cell).find((chunk) => chunk.tag === 'DATA' && chunk.size >= 8)
     if (!dataChunk) continue
     const payload = bytes.subarray(dataChunk.dataStart, dataChunk.dataEnd)
-    const parsed = extractCellMeshRefFromDataChunk(payload)
+    const parsed = extractCellMeshRefFromDataChunk(payload, includeOutsideWorld)
     if (!parsed) continue
 
     const selectedRef = resolveRefCandidates(basePath, parsed.meshRef)
@@ -3568,6 +3975,46 @@ function extractPobCellAppearanceRefs(buffer: ArrayBuffer, basePath: string): Po
   }
 
   return entries
+}
+
+/**
+ * Extracts all HPNT (hardpoint) chunks from an IFF buffer (MSH/CMP/POB/etc.).
+ * Each HPNT chunk's data layout is:
+ *   float32[12] matrix     — 3x4 affine, row-major rotation+translation
+ *   char[]      name       — null-terminated ASCII
+ * Engine source uses little-endian floats; we fall back to big-endian if the
+ * LE decode fails plausibility (some converters round-trip swapped).
+ */
+function extractHardpointsFromBuffer(buffer: ArrayBuffer, sourcePath?: string): MeshHardpoint[] {
+  const bytes = new Uint8Array(buffer)
+  const root = parseBigEndianChunks(bytes)
+  if (!root) return []
+
+  const out: MeshHardpoint[] = []
+  const stack: BinaryChunk[] = [root]
+  while (stack.length > 0) {
+    const node = stack.pop()
+    if (!node) continue
+    for (const child of node.children) stack.push(child)
+    if (node.tag !== 'HPNT' || node.type) continue
+    const size = node.dataEnd - node.dataStart
+    if (size < 49) continue // 12 floats + at least null terminator
+
+    const payload = bytes.subarray(node.dataStart, node.dataEnd)
+    let matrix = readAffineMatrix(payload, 0, true)
+    if (!isReasonableAffineMatrix(matrix)) {
+      const be = readAffineMatrix(payload, 0, false)
+      if (isReasonableAffineMatrix(be)) matrix = be
+    }
+    if (!isReasonableAffineMatrix(matrix)) continue
+
+    const nameRead = readInlineStringWithEncoding(payload, 48, 'cstr')
+    const name = nameRead.value.trim()
+    if (!name) continue
+
+    out.push({ name, matrix: matrix as number[], sourcePath })
+  }
+  return out
 }
 
 function extractDtlLastChildRef(buffer: ArrayBuffer, basePath: string): string | null {
@@ -3609,7 +4056,7 @@ function extractDtlLastChildRef(buffer: ArrayBuffer, basePath: string): string |
 
     if (!meshRef) {
       const ascii = extractAsciiStrings(
-        payload.buffer.slice(payload.byteOffset, payload.byteLength),
+        payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
         4,
       )
       const fallback = ascii.find((value) => /\.(?:apt|msh|lod|cmp|pob)$/i.test(value))
@@ -3649,6 +4096,7 @@ async function resolveMergedDecodedMeshes(
   const partSecondaryUvSetIndices: number[] = []
   const partChunkTrace: (string | undefined)[] = []
   const partShaderPaths: (string | undefined)[] = []
+  const partEffectPaths: (string | undefined)[] = []
   const partPaths: string[] = []
   const labels: string[] = []
   const seen = new Set<string>()
@@ -3688,6 +4136,7 @@ async function resolveMergedDecodedMeshes(
           partSecondaryUvSetIndices.push(strictHit.secondaryUvSetIndices[i] ?? 0)
           partChunkTrace.push(strictHit.chunkTrace[i])
           partShaderPaths.push(strictHit.shaderPaths[i])
+          partEffectPaths.push(strictHit.effectPaths[i])
           partPaths.push(norm)
         }
         const src = await lookup(norm)
@@ -3696,8 +4145,44 @@ async function resolveMergedDecodedMeshes(
       }
     }
 
-    const hit = await resolveBestDecodedMesh([entry.ref], lookup)
+    const hit = await resolveBestDecodedMesh([entry.ref], lookup, true, true)
     if (!hit) continue
+
+    // If a non-MSH reference (APT/LOD/CMP/POB) resolved to an MSH path,
+    // run strict MSH part extraction on that resolved path so per-part
+    // shader/texture bindings are preserved instead of collapsing to a
+    // single mesh-level fallback texture.
+    if (ext(hit.path) === '.msh') {
+      const resolvedStrictHit = await resolveMshPartMeshesWithTextures(hit.path, lookup)
+      if (resolvedStrictHit && resolvedStrictHit.parts.length > 0) {
+        for (let i = 0; i < resolvedStrictHit.parts.length; i += 1) {
+          parts.push(applyCellPartTransform(resolvedStrictHit.parts[i], matrix))
+          partTexturePaths.push(resolvedStrictHit.texturePaths[i] ?? '')
+          partTextureAddressU.push(resolvedStrictHit.textureAddressU[i])
+          partTextureAddressV.push(resolvedStrictHit.textureAddressV[i])
+          partTextureMipmapFilter.push(resolvedStrictHit.textureMipmapFilter[i])
+          partTextureMinificationFilter.push(resolvedStrictHit.textureMinificationFilter[i])
+          partTextureMagnificationFilter.push(resolvedStrictHit.textureMagnificationFilter[i])
+          partNormalTexturePaths.push(resolvedStrictHit.normalTexturePaths[i])
+          partNormalTextureAddressU.push(resolvedStrictHit.normalTextureAddressU[i])
+          partNormalTextureAddressV.push(resolvedStrictHit.normalTextureAddressV[i])
+          partPrimaryUvSetIndices.push(resolvedStrictHit.primaryUvSetIndices[i] ?? 0)
+          partPrimaryScaleU.push(resolvedStrictHit.primaryScaleU[i])
+          partPrimaryScaleV.push(resolvedStrictHit.primaryScaleV[i])
+          partSecondaryTexturePaths.push(resolvedStrictHit.secondaryTexturePaths[i])
+          partSecondaryTextureAddressU.push(resolvedStrictHit.secondaryTextureAddressU[i])
+          partSecondaryTextureAddressV.push(resolvedStrictHit.secondaryTextureAddressV[i])
+          partSecondaryUvSetIndices.push(resolvedStrictHit.secondaryUvSetIndices[i] ?? 0)
+          partChunkTrace.push(resolvedStrictHit.chunkTrace[i])
+          partShaderPaths.push(resolvedStrictHit.shaderPaths[i])
+          partEffectPaths.push(resolvedStrictHit.effectPaths[i])
+          partPaths.push(hit.path)
+        }
+        if (!labels.includes(hit.sourceLabel)) labels.push(hit.sourceLabel)
+        continue
+      }
+    }
+
     const resolvedPathKey = `${normalizeSwgPath(hit.path)}|${matrixSignature(matrix)}`
     if (seenResolvedMeshPaths.has(resolvedPathKey)) continue
     seenResolvedMeshPaths.add(resolvedPathKey)
@@ -3726,19 +4211,25 @@ async function resolveMergedDecodedMeshes(
         partSecondaryUvSetIndices.push(hit.meshPartSecondaryUvSetIndices?.[i] ?? 0)
         partChunkTrace.push(hit.meshPartChunkTrace?.[i])
         partShaderPaths.push(hit.meshPartShaderPaths?.[i])
+        partEffectPaths.push(hit.meshPartEffectPaths?.[i])
         partPaths.push(hit.path)
       }
     } else {
+      const meshOnlyTextureHit = await resolveTextureFromMeshShaderChain(
+        [norm, hit.path],
+        lookup,
+        { strictDeclaredOnly: true },
+      )
       parts.push(applyCellPartTransform(hit.mesh, matrix))
-      partTexturePaths.push(hit.meshPartTexturePaths?.[0] ?? '')
-      partTextureAddressU.push(hit.meshPartTextureAddressU?.[0])
-      partTextureAddressV.push(hit.meshPartTextureAddressV?.[0])
-      partTextureMipmapFilter.push(hit.meshPartTextureMipmapFilter?.[0])
-      partTextureMinificationFilter.push(hit.meshPartTextureMinificationFilter?.[0])
-      partTextureMagnificationFilter.push(hit.meshPartTextureMagnificationFilter?.[0])
-      partNormalTexturePaths.push(hit.meshPartNormalTexturePaths?.[0])
-      partNormalTextureAddressU.push(hit.meshPartNormalTextureAddressU?.[0])
-      partNormalTextureAddressV.push(hit.meshPartNormalTextureAddressV?.[0])
+      partTexturePaths.push(hit.meshPartTexturePaths?.[0] ?? meshOnlyTextureHit?.texturePath ?? '')
+      partTextureAddressU.push(hit.meshPartTextureAddressU?.[0] ?? meshOnlyTextureHit?.textureAddressU)
+      partTextureAddressV.push(hit.meshPartTextureAddressV?.[0] ?? meshOnlyTextureHit?.textureAddressV)
+      partTextureMipmapFilter.push(hit.meshPartTextureMipmapFilter?.[0] ?? meshOnlyTextureHit?.textureMipmapFilter)
+      partTextureMinificationFilter.push(hit.meshPartTextureMinificationFilter?.[0] ?? meshOnlyTextureHit?.textureMinificationFilter)
+      partTextureMagnificationFilter.push(hit.meshPartTextureMagnificationFilter?.[0] ?? meshOnlyTextureHit?.textureMagnificationFilter)
+      partNormalTexturePaths.push(hit.meshPartNormalTexturePaths?.[0] ?? meshOnlyTextureHit?.normalTexturePath)
+      partNormalTextureAddressU.push(hit.meshPartNormalTextureAddressU?.[0] ?? meshOnlyTextureHit?.normalTextureAddressU)
+      partNormalTextureAddressV.push(hit.meshPartNormalTextureAddressV?.[0] ?? meshOnlyTextureHit?.normalTextureAddressV)
       partPrimaryUvSetIndices.push(hit.meshPartPrimaryUvSetIndices?.[0] ?? 0)
       partPrimaryScaleU.push(hit.meshPartPrimaryScaleU?.[0])
       partPrimaryScaleV.push(hit.meshPartPrimaryScaleV?.[0])
@@ -3748,6 +4239,7 @@ async function resolveMergedDecodedMeshes(
       partSecondaryUvSetIndices.push(hit.meshPartSecondaryUvSetIndices?.[0] ?? 0)
       partChunkTrace.push(hit.meshPartChunkTrace?.[0])
       partShaderPaths.push(hit.meshPartShaderPaths?.[0])
+      partEffectPaths.push(hit.meshPartEffectPaths?.[0])
       partPaths.push(hit.path)
     }
 
@@ -4026,6 +4518,7 @@ function sanitizeMesh(mesh: PreviewMeshData): PreviewMeshData | null {
     uvs1: hasUvs1 ? cleanUvs1 : undefined,
     uvSets: cleanUvSets.length > 0 ? cleanUvSets : undefined,
     hasUvChannel: mesh.hasUvChannel,
+    decodeDebug: mesh.decodeDebug,
   }
 }
 
@@ -4160,29 +4653,94 @@ function buildLodSiblingMeshCandidates(lodPath: string): string[] {
   return out
 }
 
-function extractLodMeshRefs(buffer: ArrayBuffer): string[] {
-  // LOD files contain mesh file references - scan for .msh paths
+function buildLodSiblingRefCandidates(lodPath: string): string[] {
+  const normalized = normalizeSwgPath(lodPath)
+  if (!normalized.endsWith('.lod')) return []
+
+  const stem = normalized.slice(0, -4)
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (value: string) => {
+    const next = normalizeSwgPath(value)
+    const nextExt = ext(next)
+    if (!['.msh', '.lod', '.cmp', '.apt', '.pob'].includes(nextExt) || seen.has(next)) return
+    seen.add(next)
+    out.push(next)
+  }
+
+  push(`${stem}_l0.cmp`)
+  push(`${stem}_l0.lod`)
+  for (let component = 0; component <= 9; component += 1) {
+    push(`${stem}_l0_c${component}.lod`)
+    push(`${stem}_l0_c${component}.cmp`)
+  }
+  for (const mesh of buildLodSiblingMeshCandidates(lodPath)) push(mesh)
+
+  return out
+}
+
+function extractLodResolvedRefs(buffer: ArrayBuffer, basePath?: string): string[] {
   const refs = new Set<string>()
   const bytes = new Uint8Array(buffer)
-  
-  console.log('[LOD Parse] Parsing LOD file, buffer size:', buffer.byteLength)
-  
-  const decoder = new TextDecoder('utf-8', { fatal: false })
-  const fullText = decoder.decode(bytes)
-  const meshMatches = fullText.match(/[a-z0-9_/\\]+\.msh/gi)
-  
-  if (meshMatches) {
-    for (const match of meshMatches) {
-      const meshPath = normalizeSwgPath(match)
-      if (meshPath.endsWith('.msh')) {
-        refs.add(meshPath)
-        console.log('[LOD Parse] Found mesh ref:', meshPath)
-      }
+  const base = basePath ? normalizeSwgPath(basePath) : ''
+
+  const addRef = (raw: string) => {
+    const trimmed = raw.trim()
+    if (!trimmed) return
+    const resolved = resolveRefCandidates(base, trimmed)
+    for (const candidate of resolved) {
+      if (['.msh', '.lod', '.cmp', '.apt', '.pob'].includes(ext(candidate))) refs.add(candidate)
     }
   }
-  
-  console.log('[LOD Parse] Total refs extracted:', refs.size, Array.from(refs))
+
+  try {
+    const root = parseIff(buffer)
+    const stack: IffChunk[] = [root]
+    while (stack.length > 0) {
+      const node = stack.pop()
+      if (!node) continue
+      for (const child of node.children) stack.push(child)
+
+      if (!node.data || node.data.length === 0) continue
+
+      if (node.tag === 'NAME') {
+        const parsed = parseInlineSwgString(node.data)
+        if (parsed) addRef(parsed)
+      }
+
+      // Some LOD variants store path-like strings in non-NAME leaves.
+      const ascii = extractAsciiStrings(
+        node.data.buffer.slice(node.data.byteOffset, node.data.byteOffset + node.data.byteLength),
+        6,
+      )
+      for (const text of ascii) {
+        if (/\.(?:msh|lod|cmp|apt|pob)$/i.test(text)) addRef(text)
+      }
+    }
+  } catch {
+    // Fall back to raw buffer scan only if structured parse fails.
+  }
+
+  if (refs.size === 0) {
+    const decoder = new TextDecoder('utf-8', { fatal: false })
+    const fullText = decoder.decode(bytes)
+    const refMatches = fullText.match(/[a-z0-9_./\\-]+\.(?:msh|lod|cmp|apt|pob)/gi)
+    if (refMatches) {
+      for (const match of refMatches) addRef(match)
+    }
+  }
+
   return Array.from(refs)
+}
+
+function getDeterministicLodRefCandidates(buffer: ArrayBuffer, lodPath: string): string[] {
+  const explicitRefs = extractLodResolvedRefs(buffer, lodPath)
+  if (explicitRefs.length > 0) return explicitRefs
+  // Some SWG LOD variants do not expose mesh refs in NAME chunks the way our
+  // parser expects. Fall back to stable sibling-name synthesis only when the
+  // explicit parse yields nothing so deterministic mode stays authoritative
+  // where the file content is clear.
+  return buildLodSiblingRefCandidates(lodPath)
 }
 
 
@@ -4191,6 +4749,34 @@ function parseTrailingLevel(path: string): number {
   const match = lower.match(/_l(\d+)\.msh$/)
   if (!match) return Number.POSITIVE_INFINITY
   return Number.parseInt(match[1], 10)
+}
+
+// Group mesh refs by their "shape signature" (path with every `_l\d+` segment
+// stripped out) and pick the highest-detail variant per group — i.e. the one
+// whose summed LOD-level digits is smallest. This handles SWG LOD chains where
+// a single component is referenced at multiple detail levels (e.g.
+// `_l0_c0_l0_c0.msh` / `_l0_c0_l1_c0.msh` / ...) and would otherwise be
+// combined as duplicates at the same origin (causing "spiked" overlap) or
+// picked one-at-a-time (causing missing geometry).
+function pickHighestDetailLodMeshes(paths: string[]): string[] {
+  const seen = new Map<string, { path: string; score: number }>()
+  for (const raw of paths) {
+    const next = normalizeSwgPath(raw)
+    if (ext(next) !== '.msh') continue
+    const levels = Array.from(next.matchAll(/_l(\d+)(?=[_./])/g)).map((m) => Number(m[1]))
+    if (levels.length === 0) {
+      // No LOD segments — keep as-is, grouped by full path (effectively unique).
+      if (!seen.has(next)) seen.set(next, { path: next, score: 0 })
+      continue
+    }
+    const groupKey = next.replace(/_l\d+(?=[_./])/g, '_l#')
+    const score = levels.reduce((acc, v) => acc + v, 0)
+    const existing = seen.get(groupKey)
+    if (!existing || score < existing.score || (score === existing.score && next < existing.path)) {
+      seen.set(groupKey, { path: next, score })
+    }
+  }
+  return Array.from(seen.values()).map((entry) => entry.path)
 }
 
 function chooseBestByLowestLevel(paths: string[]): string[] {
@@ -4221,13 +4807,14 @@ function choosePreferredSieMeshRefs(meshRefs: string[]): string[] {
   )
   if (normalized.length === 0) return []
 
-  const componentRefs = normalized.filter((value) => /_c\d+_l\d+\.msh$/.test(value))
-  if (componentRefs.length > 0) {
-    const pickedComponent = chooseBestByLowestLevel(componentRefs)
-    // SIE-style componentized assets should resolve from component families,
-    // not unrelated fallback meshes.
-    return Array.from(new Set(pickedComponent))
-  }
+  // Group by full LOD-stripped signature so multiple detail levels of the
+  // same component (e.g. `..._l0_c0_l0_c0.msh` / `..._l0_c0_l3_c0.msh`)
+  // collapse to a single highest-detail pick, while distinct components
+  // (`_c0` walls vs `_c1` pillars) remain separate parts. Without this both
+  // (a) the `c0` walls are filtered out by an over-strict trailing-`_l#`
+  // regex, and (b) the same component's LOD copies pile up at one origin.
+  const collapsed = pickHighestDetailLodMeshes(normalized)
+  if (collapsed.length > 0) return collapsed
 
   return chooseBestByLowestLevel(normalized)
 }
@@ -4274,7 +4861,7 @@ function extractCmpPartEntries(buffer: ArrayBuffer, basePath: string): CmpPartEn
 
     if (!meshRef) {
       const ascii = extractAsciiStrings(
-        payload.buffer.slice(payload.byteOffset, payload.byteLength),
+        payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
         4,
       )
       const fallback = ascii.find((value) => /\.(?:apt|msh|lod|cmp|pob)$/i.test(value))
@@ -4437,7 +5024,7 @@ async function resolveCmpCompositeMesh(
   const partPaths: string[] = []
 
   for (const entry of entries) {
-    const hit = await resolveBestDecodedMesh([entry.ref], lookup, false)
+    const hit = await resolveBestDecodedMesh([entry.ref], lookup, false, true)
     if (!hit?.mesh) continue
     const transformed = applyCmpPartTransform(hit.mesh, entry.matrix)
     const normalized = normalizeCandidateMesh(transformed)
@@ -4492,12 +5079,12 @@ async function collectSieChainMeshRefs(
 
     if (nextExt === '.lod') {
       // Parse LOD file to extract actual mesh references
-      const lodRefs = extractLodMeshRefs(buffer)
+      const lodRefs = getDeterministicLodRefCandidates(buffer, next.path)
       for (const lodRef of lodRefs) {
         refs.push(lodRef)
       }
       // Also try filename-based guessing as fallback
-      for (const sibling of buildLodSiblingMeshCandidates(next.path)) {
+      for (const sibling of buildLodSiblingRefCandidates(next.path)) {
         refs.push(sibling)
       }
     }
@@ -4507,6 +5094,76 @@ async function collectSieChainMeshRefs(
       if (refExt === '.msh') {
         meshes.add(ref)
       } else if (['.pob', '.lod', '.cmp', '.apt'].includes(refExt)) {
+        queue.push({ path: ref, depth: next.depth + 1 })
+      }
+    }
+  }
+
+  return Array.from(meshes)
+}
+
+async function collectDeclaredMeshRefs(
+  roots: string[],
+  lookup: RepositoryLookup,
+  maxDepth = 7,
+): Promise<string[]> {
+  const queue: Array<{ path: string; depth: number }> = roots
+    .map((value) => normalizeSwgPath(value))
+    .filter(Boolean)
+    .map((path) => ({ path, depth: 0 }))
+  const visited = new Set<string>()
+  const meshes = new Set<string>()
+
+  while (queue.length > 0) {
+    const next = queue.shift()
+    if (!next) break
+    if (visited.has(next.path)) continue
+    visited.add(next.path)
+
+    const nextExt = ext(next.path)
+    if (nextExt === '.msh') {
+      meshes.add(next.path)
+      continue
+    }
+
+    if (next.depth >= maxDepth) continue
+    if (!['.pob', '.apt', '.lod', '.cmp', '.iff'].includes(nextExt)) continue
+
+    const source = await lookup(next.path)
+    if (!source) continue
+
+    const buffer = await source.file.arrayBuffer()
+    const refs = getResolvedRefCandidatesCached(next.path, buffer)
+
+    if (nextExt === '.apt') {
+      const detailRef = extractDtlLastChildRef(buffer, next.path)
+      if (detailRef) refs.push(detailRef)
+    }
+
+    if (nextExt === '.cmp') {
+      const cmpEntries = extractCmpPartEntries(buffer, next.path)
+      for (const entry of cmpEntries) refs.push(entry.ref)
+    }
+
+    if (nextExt === '.pob') {
+      // Exterior chain must include world/outside CELL references for full shell/roof assembly.
+      const pobCellRefs = extractPobCellAppearanceRefs(buffer, next.path, true)
+      for (const entry of pobCellRefs) refs.push(entry.ref)
+    }
+
+    if (nextExt === '.lod') {
+      // Deterministic: prefer explicit LOD mesh refs, but if the file encodes
+      // them in an unsupported variant, use a stable sibling-name fallback
+      // instead of dropping the exterior entirely.
+      const lodRefs = getDeterministicLodRefCandidates(buffer, next.path)
+      for (const lodRef of lodRefs) refs.push(lodRef)
+    }
+
+    for (const ref of refs) {
+      const refExt = ext(ref)
+      if (refExt === '.msh') {
+        meshes.add(ref)
+      } else if (['.pob', '.apt', '.lod', '.cmp', '.iff'].includes(refExt)) {
         queue.push({ path: ref, depth: next.depth + 1 })
       }
     }
@@ -4542,6 +5199,7 @@ async function resolveSieCompositeMesh(
   const partSecondaryUvSetIndices: number[] = []
   const partChunkTrace: (string | undefined)[] = []
   const partShaderPaths: (string | undefined)[] = []
+  const partEffectPaths: (string | undefined)[] = []
   let sourceLabel = ''
 
   for (const path of preferredRefs) {
@@ -4570,6 +5228,7 @@ async function resolveSieCompositeMesh(
         partSecondaryUvSetIndices.push(partHit.secondaryUvSetIndices[i] ?? 0)
         partChunkTrace.push(partHit.chunkTrace[i])
         partShaderPaths.push(partHit.shaderPaths[i])
+        partEffectPaths.push(partHit.effectPaths[i])
       }
       continue
     }
@@ -4601,6 +5260,7 @@ async function resolveSieCompositeMesh(
     partSecondaryUvSetIndices.push(0)
     partChunkTrace.push(undefined)
     partShaderPaths.push(partTextureHit?.shaderPath)
+    partEffectPaths.push(undefined)
   }
 
   const merged = combineMeshes(parts)
@@ -4630,6 +5290,7 @@ async function resolveSieCompositeMesh(
     meshPartSecondaryUvSetIndices: partSecondaryUvSetIndices,
     meshPartChunkTrace: partChunkTrace,
     meshPartShaderPaths: partShaderPaths,
+    meshPartEffectPaths: partEffectPaths,
   }
 }
 
@@ -4660,6 +5321,7 @@ async function resolveKnownPalaceComposite(
   const partSecondaryUvSetIndices: number[] = []
   const partChunkTrace: (string | undefined)[] = []
   const partShaderPaths: (string | undefined)[] = []
+  const partEffectPaths: (string | undefined)[] = []
   let sourceLabel = ''
 
   // SIE log shows this family is componentized as c0..c9 with l-level variants.
@@ -4701,6 +5363,7 @@ async function resolveKnownPalaceComposite(
         partSecondaryUvSetIndices.push(partHit.secondaryUvSetIndices[i] ?? 0)
         partChunkTrace.push(partHit.chunkTrace[i])
         partShaderPaths.push(partHit.shaderPaths[i])
+        partEffectPaths.push(partHit.effectPaths[i])
       }
       continue
     }
@@ -4732,6 +5395,7 @@ async function resolveKnownPalaceComposite(
     partSecondaryUvSetIndices.push(0)
     partChunkTrace.push(undefined)
     partShaderPaths.push(partTextureHit?.shaderPath)
+    partEffectPaths.push(undefined)
   }
 
   const merged = combineMeshes(parts)
@@ -4760,6 +5424,7 @@ async function resolveKnownPalaceComposite(
     meshPartSecondaryUvSetIndices: partSecondaryUvSetIndices,
     meshPartChunkTrace: partChunkTrace,
     meshPartShaderPaths: partShaderPaths,
+    meshPartEffectPaths: partEffectPaths,
   }
 }
 
@@ -4808,24 +5473,22 @@ async function resolveBestDecodedMesh(
     }
 
     if (candidateExt === '.lod') {
-      // Parse LOD file to extract actual mesh references
-      const lodRefs = extractLodMeshRefs(buffer)
+      // Deterministic LOD handling should walk the declared child chain
+      // (nested LOD/CMP/APT/POB) until it reaches concrete mesh leaves.
+      const lodRefsAll = await collectDeclaredMeshRefs([candidate], lookup, 4)
+
       if (!deterministicOrder) {
-        // Also get refs from generic string extraction
-        const genericRefs = Array.from(
-          new Set(getResolvedRefCandidatesCached(candidate, buffer)),
-        ).filter((value) => ext(value) === '.msh')
-
-        for (const ref of genericRefs) {
-          if (!lodRefs.includes(ref)) lodRefs.push(ref)
-        }
-
-        // Fallback to filename-based guessing
+        // Non-deterministic mode can broaden further with extra filename-based guesses.
         const synthesizedRefs = buildLodSiblingMeshCandidates(candidate)
         for (const sibling of synthesizedRefs) {
-          if (!lodRefs.includes(sibling)) lodRefs.push(sibling)
+          if (!lodRefsAll.includes(sibling)) lodRefsAll.push(sibling)
         }
       }
+
+      // Per LOD chain, collapse multiple detail levels of the same component
+      // into a single highest-detail pick so the combine step assembles real
+      // shell parts rather than overlaying duplicate LOD copies.
+      const lodRefs = pickHighestDetailLodMeshes(lodRefsAll)
 
       const lodPartMeshes: PreviewMeshData[] = []
 
@@ -4857,6 +5520,10 @@ async function resolveBestDecodedMesh(
         })
         if (chosen) return chosen
       }
+
+      // Deterministic mode: never decode raw .lod payload as geometry.
+      // LOD must resolve through referenced mesh paths only.
+      continue
     }
 
     const decoded = extractMeshFromAsset(buffer, candidate)
@@ -4947,16 +5614,19 @@ export async function resolveTemplateVisual(
 
   const appearanceBuffer = await appearanceSource.file.arrayBuffer()
   const appearanceRefs = getResolvedRefCandidatesCached(appearancePath, appearanceBuffer)
-
-  if (ext(appearancePath) === '.pob') {
-    // POB is a frequent root for large building appearances and directly references LOD/MSH assets.
-    appearanceRefs.unshift(appearancePath)
-  }
+  const pobCellEntries = ext(appearancePath) === '.pob'
+    ? extractPobCellAppearanceRefs(appearanceBuffer, appearancePath)
+    : []
 
   const shaderHit = await resolveFirstExistingByExt(appearanceRefs, ['.sht', '.sat', '.trt'], lookup)
   let shaderPath = shaderHit?.path
 
   let meshCandidates = [...appearanceRefs]
+  if (ext(appearancePath) === '.pob') {
+    // Deterministic ordering: prefer explicitly referenced exterior LOD/MSH first.
+    // Keep the top-level POB decode as fallback, not first choice.
+    meshCandidates.push(appearancePath)
+  }
   let detailPreferredRef: string | null = null
   if (ext(appearancePath) === '.apt') {
     detailPreferredRef = extractDtlLastChildRef(appearanceBuffer, appearancePath)
@@ -4976,9 +5646,225 @@ export async function resolveTemplateVisual(
   }
 
   meshCandidates = Array.from(new Set(meshCandidates))
-  const meshHintHit = await resolveFirstExistingByExt(meshCandidates, ['.msh', '.lod', '.pob'], lookup)
-  const decodedMeshHit = await resolveBestDecodedMesh(meshCandidates, lookup, true, true)
+  const effectiveExteriorCandidatesUnordered = meshCandidates
+
+  // ---------------- Hardpoint aggregation ----------------
+  // Collect HPNT chunks along the entire appearance chain (top appearance buffer,
+  // each POB cell's appearance, each declared CMP/MSH/LOD in the candidate set).
+  // Dedupe by name + translation so we don't list mirror buffers twice.
+  const collectedHardpoints: MeshHardpoint[] = []
+  {
+    const seenHpKeys = new Set<string>()
+    const addHardpoints = (list: MeshHardpoint[]) => {
+      for (const hp of list) {
+        const t = hp.matrix
+        const key = `${hp.name}|${t[3].toFixed(3)},${t[7].toFixed(3)},${t[11].toFixed(3)}`
+        if (seenHpKeys.has(key)) continue
+        seenHpKeys.add(key)
+        collectedHardpoints.push(hp)
+      }
+    }
+    addHardpoints(extractHardpointsFromBuffer(appearanceBuffer, appearancePath))
+
+    const scanPaths = new Set<string>()
+    for (const entry of pobCellEntries) scanPaths.add(entry.ref)
+    for (const candidate of meshCandidates) {
+      const e = ext(candidate)
+      if (e === '.msh' || e === '.lod' || e === '.cmp' || e === '.pob' || e === '.apt') {
+        scanPaths.add(candidate)
+      }
+    }
+    scanPaths.delete(appearancePath)
+
+    // Cap scans to avoid runaway lookups on pathological assets.
+    let scanned = 0
+    const MAX_HP_SCANS = 256
+    for (const p of scanPaths) {
+      if (scanned >= MAX_HP_SCANS) break
+      scanned += 1
+      try {
+        const src = await lookup(p)
+        if (!src) continue
+        const buf = await src.file.arrayBuffer()
+        addHardpoints(extractHardpointsFromBuffer(buf, p))
+      } catch {
+        // Best-effort: a single broken buffer should not block resolution.
+      }
+    }
+  }
+  // -------------------------------------------------------
+
+  const extPriority = (value: string): number => {
+    const valueExt = ext(value)
+    if (valueExt === '.msh') return 0
+    if (valueExt === '.lod') return 1
+    if (valueExt === '.cmp') return 2
+    if (valueExt === '.apt') return 3
+    if (valueExt === '.pob') return 4
+    return 5
+  }
+  const effectiveExteriorCandidates = [...effectiveExteriorCandidatesUnordered]
+    .sort((a, b) => {
+      const byType = extPriority(a) - extPriority(b)
+      if (byType !== 0) return byType
+      return a.localeCompare(b)
+    })
+
+  const declaredExteriorMeshRefs = await collectDeclaredMeshRefs(effectiveExteriorCandidates, lookup)
+  const deterministicExteriorCandidates = declaredExteriorMeshRefs.length > 0
+    ? declaredExteriorMeshRefs
+    : effectiveExteriorCandidates
+
+  console.log('[Resolver Exterior] Candidate trace', {
+    template: normalizedTemplate,
+    appearance: appearancePath,
+    effectiveExteriorCandidates,
+    declaredExteriorMeshRefs,
+    deterministicExteriorCandidates,
+  })
+
+  const meshHintHit = await resolveFirstExistingByExt(deterministicExteriorCandidates, ['.msh', '.lod', '.pob'], lookup)
+  const isPrimaryExteriorDecodeCandidate = (value: string): boolean => {
+    const valueExt = ext(value)
+    return valueExt === '.msh' || valueExt === '.lod' || valueExt === '.cmp' || valueExt === '.apt'
+  }
+  const exteriorDecodePrimary = deterministicExteriorCandidates.filter(isPrimaryExteriorDecodeCandidate)
+  const exteriorEntriesPrimary: PobCellAppearanceEntry[] = exteriorDecodePrimary.map((ref) => ({ ref }))
+  const mergedExteriorPrimaryHit = await resolveMergedDecodedMeshes(exteriorEntriesPrimary, lookup)
+  const bestDecodedExteriorPrimaryHit = exteriorDecodePrimary.length > 0
+    ? await resolveBestDecodedMesh(exteriorDecodePrimary, lookup, true, true)
+    : null
+  const sieCompositePrimaryHit = exteriorDecodePrimary.length > 0
+    ? await resolveSieCompositeMesh(exteriorDecodePrimary, lookup)
+    : null
+
+  const secondaryCandidateSet = Array.from(new Set(effectiveExteriorCandidates.filter(isPrimaryExteriorDecodeCandidate)))
+  const hasDifferentSecondarySet = secondaryCandidateSet.length !== exteriorDecodePrimary.length
+    || secondaryCandidateSet.some((value, index) => value !== exteriorDecodePrimary[index])
+  const exteriorEntriesSecondary: PobCellAppearanceEntry[] = hasDifferentSecondarySet
+    ? secondaryCandidateSet.map((ref) => ({ ref }))
+    : []
+  const mergedExteriorSecondaryHit = exteriorEntriesSecondary.length > 0
+    ? await resolveMergedDecodedMeshes(exteriorEntriesSecondary, lookup)
+    : null
+  const bestDecodedExteriorSecondaryHit = exteriorEntriesSecondary.length > 0
+    ? await resolveBestDecodedMesh(secondaryCandidateSet, lookup, true, true)
+    : null
+  const sieCompositeSecondaryHit = exteriorEntriesSecondary.length > 0
+    ? await resolveSieCompositeMesh(secondaryCandidateSet, lookup)
+    : null
+  const knownPalaceExteriorHit = await resolveKnownPalaceComposite(appearancePath, lookup)
+  const extentOfHit = (hit: DecodedMeshHit | null): number | null => {
+    if (!hit?.mesh) return null
+    const bounds = getMeshBounds(hit.mesh)
+    if (!bounds) return null
+    const extent = Math.max(bounds.sizeX, bounds.sizeY, bounds.sizeZ)
+    if (!Number.isFinite(extent) || extent <= 0) return null
+    return extent
+  }
+
+  const rawExteriorCandidates = [
+    { tag: 'knownPalace', hit: knownPalaceExteriorHit },
+    { tag: 'siePrimary', hit: sieCompositePrimaryHit },
+    { tag: 'mergedPrimary', hit: mergedExteriorPrimaryHit },
+    { tag: 'bestPrimary', hit: bestDecodedExteriorPrimaryHit },
+    { tag: 'sieSecondary', hit: sieCompositeSecondaryHit },
+    { tag: 'mergedSecondary', hit: mergedExteriorSecondaryHit },
+    { tag: 'bestSecondary', hit: bestDecodedExteriorSecondaryHit },
+  ]
+
+  const extentSamples = rawExteriorCandidates
+    .map((entry) => extentOfHit(entry.hit))
+    .filter((value): value is number => value !== null)
+    .sort((a, b) => a - b)
+  const referenceExtent = extentSamples.length > 0
+    ? extentSamples[Math.floor(extentSamples.length / 2)]
+    : null
+
+  const exteriorHitScore = (hit: DecodedMeshHit | null): number => {
+    if (!hit?.mesh) return Number.NEGATIVE_INFINITY
+    const extent = extentOfHit(hit)
+    if (extent === null) return Number.NEGATIVE_INFINITY
+
+    if (referenceExtent !== null) {
+      // Reject pathological exploded/collapsed geometry relative to peer candidates.
+      if (extent > referenceExtent * 6 || extent < referenceExtent / 6) {
+        return Number.NEGATIVE_INFINITY
+      }
+    }
+
+    // Absolute safety gate for known bad decodes that explode to extreme bounds.
+    if (extent > 5000) return Number.NEGATIVE_INFINITY
+
+    const partCount = hit.meshParts?.length ?? 1
+    const texturedPartCount = (hit.meshPartTexturePaths ?? []).filter((value) => Boolean(value && value.trim().length > 0)).length
+    return partCount * 1_000_000_000 + texturedPartCount * 1_000_000 + meshQualityScore(hit.mesh)
+  }
+
+  const rankedExteriorHits = rawExteriorCandidates
+    .map((entry) => ({
+      ...entry,
+      extent: extentOfHit(entry.hit),
+      score: exteriorHitScore(entry.hit),
+    }))
+    .sort((a, b) => b.score - a.score)
+
+  const isRenderableExterior = (entry: { score: number }) =>
+    Number.isFinite(entry.score) && entry.score > Number.NEGATIVE_INFINITY
+
+  const isPalaceFamily =
+    normalizedTemplate.includes('palace_naboo_theed') ||
+    appearancePath.includes('thm_nboo_thed_theed_palace') ||
+    appearancePath.includes('shared_base_palace')
+
+  const palacePrecedence = [
+    'knownPalace',
+    'siePrimary',
+    'mergedPrimary',
+    'bestPrimary',
+    'sieSecondary',
+    'mergedSecondary',
+    'bestSecondary',
+  ] as const
+
+  const chosenExterior = isPalaceFamily
+    ? palacePrecedence
+        .map((tag) => rankedExteriorHits.find((entry) => entry.tag === tag))
+        .find((entry): entry is NonNullable<typeof entry> => Boolean(entry && isRenderableExterior(entry)))
+      ?? rankedExteriorHits.find((entry) => isRenderableExterior(entry))
+    : rankedExteriorHits.find((entry) => isRenderableExterior(entry))
+
+  const decodedMeshHit = chosenExterior?.hit ?? null
   const meshPath = decodedMeshHit?.path ?? meshHintHit?.path
+
+  console.log('[Resolver Exterior] Merge result', {
+    template: normalizedTemplate,
+    meshHintPath: meshHintHit?.path,
+    exteriorDecodePrimary,
+    secondaryCandidateSet,
+    mergedPrimaryPath: mergedExteriorPrimaryHit?.path,
+    mergedPrimaryPartCount: mergedExteriorPrimaryHit?.meshParts?.length ?? 0,
+    bestPrimaryPath: bestDecodedExteriorPrimaryHit?.path,
+    bestPrimaryPartCount: bestDecodedExteriorPrimaryHit?.meshParts?.length ?? (bestDecodedExteriorPrimaryHit?.mesh ? 1 : 0),
+    siePrimaryPath: sieCompositePrimaryHit?.path,
+    siePrimaryPartCount: sieCompositePrimaryHit?.meshParts?.length ?? (sieCompositePrimaryHit?.mesh ? 1 : 0),
+    mergedSecondaryPath: mergedExteriorSecondaryHit?.path,
+    mergedSecondaryPartCount: mergedExteriorSecondaryHit?.meshParts?.length ?? 0,
+    bestSecondaryPath: bestDecodedExteriorSecondaryHit?.path,
+    bestSecondaryPartCount: bestDecodedExteriorSecondaryHit?.meshParts?.length ?? (bestDecodedExteriorSecondaryHit?.mesh ? 1 : 0),
+    sieSecondaryPath: sieCompositeSecondaryHit?.path,
+    sieSecondaryPartCount: sieCompositeSecondaryHit?.meshParts?.length ?? (sieCompositeSecondaryHit?.mesh ? 1 : 0),
+    knownPalacePath: knownPalaceExteriorHit?.path,
+    knownPalacePartCount: knownPalaceExteriorHit?.meshParts?.length ?? (knownPalaceExteriorHit?.mesh ? 1 : 0),
+    isPalaceFamily,
+    palacePrecedence,
+    referenceExtent,
+    chosenExteriorTag: chosenExterior?.tag,
+    rankedExteriorHits: rankedExteriorHits.map((entry) => ({ tag: entry.tag, score: entry.score, extent: entry.extent, path: entry.hit?.path })),
+    decodedPath: decodedMeshHit?.path,
+    decodedPartCount: decodedMeshHit?.meshParts?.length ?? (decodedMeshHit?.mesh ? 1 : 0),
+    finalMeshPath: meshPath,
+  })
 
   let texturePath: string | undefined
   let textureAddressU: TextureAddressMode | undefined
@@ -5037,10 +5923,8 @@ export async function resolveTemplateVisual(
   if (ext(appearancePath) === '.pob') {
     // Keep embedded POB geometry as a fallback, but still prefer external LOD/MSH meshes.
     pobMeshFallback = extractMeshFromAsset(appearanceBuffer, appearancePath) ?? undefined
-    const pobCellRefs = extractPobCellAppearanceRefs(appearanceBuffer, appearancePath)
-      .filter((value) => value.ref !== appearancePath)
-    if (pobCellRefs.length > 0) {
-      pobInteriorHit = await resolveMergedDecodedMeshes(pobCellRefs, lookup)
+    if (pobCellEntries.length > 0) {
+      pobInteriorHit = await resolveMergedDecodedMeshes(pobCellEntries, lookup)
     }
   }
 
@@ -5068,6 +5952,7 @@ export async function resolveTemplateVisual(
         meshPath: appearancePath,
         sourceLabel: appearanceSource.sourceLabel,
         mesh: pobMeshFallback,
+        hardpoints: collectedHardpoints.length ? collectedHardpoints : undefined,
         status: 'mesh',
       }
     }
@@ -5095,6 +5980,7 @@ export async function resolveTemplateVisual(
       shaderStageTexturePaths,
       shaderStageNormalTexturePaths,
       sourceLabel: appearanceSource.sourceLabel,
+      hardpoints: collectedHardpoints.length ? collectedHardpoints : undefined,
       status: 'appearance-only',
     }
   }
@@ -5119,9 +6005,9 @@ export async function resolveTemplateVisual(
   const renderMeshPartSecondaryUvSetIndices: number[] = []
   const renderMeshPartChunkTrace: (string | undefined)[] = []
   const renderMeshPartShaderPaths: (string | undefined)[] = []
+  const renderMeshPartEffectPaths: (string | undefined)[] = []
   const renderMeshPartDomains: Array<'exterior' | 'interior'> = []
   const seenRenderPartKeys = new Set<string>()
-  const useDeclaredPobExterior = ext(appearancePath) === '.pob' && Boolean(pobMeshFallback)
 
   const buildRenderPartKey = (
     part: PreviewMeshData,
@@ -5175,6 +6061,7 @@ export async function resolveTemplateVisual(
     secondaryUvSetIndices: number[] = [],
     shaderPaths: (string | undefined)[] = [],
     chunkTrace: (string | undefined)[] = [],
+    effectPaths: (string | undefined)[] = [],
     domain: 'exterior' | 'interior' = 'exterior',
   ) => {
     for (let i = 0; i < parts.length; i++) {
@@ -5193,9 +6080,10 @@ export async function resolveTemplateVisual(
       const hasAnyUv = hasUv0 || hasUv1 || hasUvSet
 
       // Collision/aux parts often appear in decoded meshes with no shader binding and no UVs.
-      // They produce stretched artifacts in preview and should not enter visual render output.
+      // Apply this cull only to interior assembly; exterior shells may include valid geometry
+      // chunks without explicit per-part bindings.
       const hasBinding = Boolean(baseTexture || normalTexture || secondaryTexture || (trace && trace !== 'n/a'))
-      if (!hasBinding && !hasAnyUv) continue
+      if (domain === 'interior' && !hasBinding && !hasAnyUv) continue
 
       const primaryUv = primaryUvSetIndices[i] ?? 0
       const partKey = buildRenderPartKey(part, baseTexture, primaryUv)
@@ -5218,40 +6106,13 @@ export async function resolveTemplateVisual(
       renderMeshPartSecondaryTextureAddressV.push(secondaryTextureAddressV[i])
       renderMeshPartSecondaryUvSetIndices.push(secondaryUvSetIndices[i] ?? 0)
       renderMeshPartShaderPaths.push(shaderPaths[i])
+      renderMeshPartEffectPaths.push(effectPaths[i])
       renderMeshPartChunkTrace.push(chunkTrace[i])
       renderMeshPartDomains.push(domain)
     }
   };
 
-  if (useDeclaredPobExterior && pobMeshFallback) {
-    // Deterministic rule: for declared POB appearances, treat the top-level POB mesh
-    // as the authoritative exterior shell before any derived/decoded mesh refs.
-    finalMeshParts.push(pobMeshFallback)
-    finalPathParts.push(appearancePath)
-    finalSourceParts.push(appearanceSource.sourceLabel)
-    processMeshParts(
-      [pobMeshFallback],
-      [texturePath ?? ''],
-      [textureAddressU],
-      [textureAddressV],
-      [textureMipmapFilter],
-      [textureMinificationFilter],
-      [textureMagnificationFilter],
-      [normalTexturePath],
-      [normalTextureAddressU],
-      [normalTextureAddressV],
-      [0],
-      [undefined],
-      [undefined],
-      [undefined],
-      [0],
-      [shaderPath],
-      [`declared-pob:${appearancePath}`],
-      'exterior',
-    )
-  }
-
-  if (decodedMeshHit?.mesh && !useDeclaredPobExterior) {
+  if (decodedMeshHit?.mesh) {
     finalMeshParts.push(decodedMeshHit.mesh)
     finalPathParts.push(decodedMeshHit.path)
     finalSourceParts.push(decodedMeshHit.sourceLabel)
@@ -5277,6 +6138,7 @@ export async function resolveTemplateVisual(
       decodedMeshHit.meshPartSecondaryUvSetIndices,
       decodedMeshHit.meshPartShaderPaths,
       decodedMeshHit.meshPartChunkTrace,
+      decodedMeshHit.meshPartEffectPaths,
       'exterior',
     )
   }
@@ -5301,6 +6163,7 @@ export async function resolveTemplateVisual(
     let interiorSecondaryUvs: number[] = pobInteriorHit.meshPartSecondaryUvSetIndices || []
     let interiorShaderPaths: (string | undefined)[] = pobInteriorHit.meshPartShaderPaths || []
     let interiorChunkTrace: (string | undefined)[] = pobInteriorHit.meshPartChunkTrace || []
+    let interiorEffectPaths: (string | undefined)[] = pobInteriorHit.meshPartEffectPaths || []
 
     const isLikelyExteriorTagged = (value: string): boolean => {
       const lower = value.toLowerCase()
@@ -5351,6 +6214,7 @@ export async function resolveTemplateVisual(
     interiorSecondaryUvs = keptIndices.map((index) => pickOr(interiorSecondaryUvs, index, 0))
     interiorShaderPaths = keptIndices.map((index) => pickOr(interiorShaderPaths, index, undefined))
     interiorChunkTrace = keptIndices.map((index) => pickOr(interiorChunkTrace, index, undefined))
+    interiorEffectPaths = keptIndices.map((index) => pickOr(interiorEffectPaths, index, undefined))
 
     interiorPrimaryUvs = interiorParts.map((part, i) =>
       chooseInteriorPrimaryUvSet(part, interiorPrimaryUvs[i] ?? 0)
@@ -5408,13 +6272,14 @@ export async function resolveTemplateVisual(
       interiorSecondaryUvs,
       interiorShaderPaths,
       interiorChunkTrace,
+      interiorEffectPaths,
       'interior',
     )
   }
 
   // Deterministic fallback: if no authoritative/decoded exterior was resolved,
   // keep the declared appearance POB mesh as exterior even when interior cells exist.
-  if (pobMeshFallback && !decodedMeshHit?.mesh && !useDeclaredPobExterior) {
+  if (pobMeshFallback && !decodedMeshHit?.mesh) {
     finalMeshParts.push(pobMeshFallback)
     finalPathParts.push(appearancePath)
     finalSourceParts.push(appearanceSource.sourceLabel)
@@ -5515,12 +6380,16 @@ export async function resolveTemplateVisual(
     meshPartShaderPaths: renderMeshPartShaderPaths.length
       ? renderMeshPartShaderPaths
       : undefined,
+    meshPartEffectPaths: renderMeshPartEffectPaths.length
+      ? renderMeshPartEffectPaths
+      : undefined,
     meshPartDomains: renderMeshPartDomains.length
       ? renderMeshPartDomains
       : undefined,
     meshPartChunkTrace: renderMeshPartChunkTrace.length
       ? renderMeshPartChunkTrace
       : undefined,
+    hardpoints: collectedHardpoints.length ? collectedHardpoints : undefined,
     status: finalMesh ? 'mesh' : 'appearance-only',
   }
 }
